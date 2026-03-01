@@ -1,0 +1,59 @@
+# === OAI stage-1: descriptor-only gradients for all classes ===
+
+# data
+images_dir: /projects/prjs1722/oai_baselines/nnunet/nnUNet_raw/Dataset701_OAIKnee/imagesTr
+labels_dir: /projects/prjs1722/oai_baselines/nnunet/nnUNet_raw/Dataset701_OAIKnee/labelsTr
+splits_file: /projects/prjs1722/oai_baselines/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200] #increased STD patches
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 8
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 600
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+# === Exp toggles ===
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all classes
+desc_only_classes: [1, 2, 3, 4]
+centroid_classes: [1, 2, 3, 4]
+volume_classes: [1, 2, 3, 4]
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 100.0              # bumping up to 100 because effect is so small
+lambda_centroid: 300.0            # bumping up to 300 because effect is so small
+centroid_norm: true             # normalize coords to [0,1]
+
+
+workdir: /projects/prjs1722/oai_baselines/meunet_raw/results/stage1_desc_only_all_both_ESP100_minSTD2_maxEXP_600ep

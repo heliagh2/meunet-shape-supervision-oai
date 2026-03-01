@@ -1,0 +1,61 @@
+
+images_dir: /projects/prjs1722/oai_baselines/nnunet/nnUNet_raw/Dataset701_OAIKnee/imagesTr
+labels_dir: /projects/prjs1722/oai_baselines/nnunet/nnUNet_raw/Dataset701_OAIKnee/labelsTr
+
+splits_file: /scratch-shared/hghasemi/nnunet_preprocessed/Dataset701_OAIKnee/splits_final.json
+
+dataset_name: Dataset701_OAIKnee
+
+classes:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+
+
+in_channels: 1
+n_classes: 5
+
+# patch-based training (like original MeUNet)
+patch_size:
+  - 160
+  - 160
+  - 160
+expand_factor: 1.25
+
+enc_channels:
+  - 16
+  - 32
+  - 64
+  - 128
+dec_channels:
+  - 16
+  - 32
+  - 64
+norm: batch
+
+
+batch_size: 2
+num_workers: 8
+fg_sampling_prob: 0.5
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 300
+early_stop_patience: 40
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+
+workdir: /projects/prjs1722/oai_baselines/meunet_raw/results/stage1_raw
