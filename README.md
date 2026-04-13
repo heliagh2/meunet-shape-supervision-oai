@@ -58,7 +58,7 @@ pip install -r requirements.txt
 
 ## Dataset Requirements
 
-This repository assumes the dataset follows the nnU-Net raw data structure.
+This repository can read either the nnU-Net raw data structure or flat image/label directories, as long as case IDs still match `splits_final.json`.
 
 Expected directory layout:
 
@@ -75,6 +75,16 @@ nnUNet_raw/
       XXXX_R.nii.gz
 ```
 
+Also supported is a flat layout such as:
+
+```
+knee_dataset/
+  OAI_ZIB_DESS/
+    XXXX_R.nii.gz
+  OAI_ZIB_segmentations/
+    XXXX_R_segmentation.nii.gz
+```
+
 Additionally, a precomputed split file is required, I have added mine:
 
 ```
@@ -86,8 +96,8 @@ nnUNet_preprocessed/
 ### Important Notes
 
 * The code assumes case IDs follow the format `XXXX_R`.
-* `imagesTr` and `labelsTr` must match exactly by stem.
-* `imagesTs` and `labelsTs` must match exactly by stem.
+* Supported image filenames are `XXXX_R_0000.nii.gz` and `XXXX_R.nii.gz`.
+* Supported label filenames are `XXXX_R.nii.gz` and `XXXX_R_segmentation.nii.gz`.
 * No subject overlap should exist between train/val/test.
 
 The repository does not include the dataset.

@@ -8,6 +8,19 @@ import nibabel as nib
 import csv
 
 
+def normalize_case_name(path_or_name):
+    name = os.path.basename(path_or_name)
+    if name.endswith(".nii.gz"):
+        name = name[:-7]
+    elif name.endswith(".nii"):
+        name = name[:-4]
+    if name.endswith("_0000"):
+        name = name[:-5]
+    if name.endswith("_segmentation"):
+        name = name[:-13]
+    return name
+
+
 def dice_per_class(gt, pred, labels):
     scores = []
     for lab in labels:
@@ -36,6 +49,9 @@ def main():
     if not gt_files:
         raise RuntimeError(f"No GT files found in {args.gt_dir}")
 
+    pred_files = sorted(glob.glob(os.path.join(args.pred_dir, "*.nii*")))
+    pred_map = {normalize_case_name(path): path for path in pred_files}
+
     print(f"[INFO] Found {len(gt_files)} GT files")
     print(f"[INFO] Using prediction dir: {args.pred_dir}")
 
@@ -46,8 +62,9 @@ def main():
 
     for gt_path in gt_files:
         name = os.path.basename(gt_path)
-        pred_path = os.path.join(args.pred_dir, name)
-        if not os.path.exists(pred_path):
+        case_id = normalize_case_name(name)
+        pred_path = pred_map.get(case_id)
+        if pred_path is None:
             print(f"[WARN] Missing prediction for {name}, skipping")
             missing += 1
             continue
@@ -66,7 +83,7 @@ def main():
         dice = dice_per_class(gt, pred, args.labels)
         all_dice.append(dice)
 
-        row = {"case": name}
+        row = {"case": case_id}
         for lab, val in zip(args.labels, dice):
             row[f"dice_c{lab}"] = float(val) if not np.isnan(val) else ""
         rows.append(row)
