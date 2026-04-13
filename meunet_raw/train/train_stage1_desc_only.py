@@ -245,6 +245,71 @@ def compute_centroid_penalty(
     return quadratic_penalty(diff.reshape(-1), torch.zeros_like(diff).reshape(-1)).mean()
 
 
+def compute_avg_distance_to_centroid_penalty(
+    logits,
+    target,
+    n_classes,
+    distance_class,
+    centroid_norm=True,
+    ignore_index=-1,
+    eps=1e-6,
+):
+    """
+    Quadratic penalty on the mean Euclidean distance to the class centroid.
+    logits: (B,C,D,H,W)
+    target: (B,D,H,W) MUST match logits spatial size
+    Returns scalar average to centroid
+    """
+    device = logits.device
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index).float().unsqueeze(1)
+
+    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
+    one_hot = one_hot.to(device)
+
+    pred_w = probs[:, distance_class:distance_class+1] * valid
+    gt_mask = one_hot[:, distance_class:distance_class+1] * valid
+
+    B, _, D, H, W = pred_w.shape
+
+    if centroid_norm:
+        zz = torch.linspace(0, 1, D, device=device).view(1, 1, D, 1, 1)
+        yy = torch.linspace(0, 1, H, device=device).view(1, 1, 1, H, 1)
+        xx = torch.linspace(0, 1, W, device=device).view(1, 1, 1, 1, W)
+    else:
+        zz = torch.arange(D, device=device).float().view(1, 1, D, 1, 1)
+        yy = torch.arange(H, device=device).float().view(1, 1, 1, H, 1)
+        xx = torch.arange(W, device=device).float().view(1, 1, 1, 1, W)
+
+    coords = torch.cat(
+        [
+            zz.expand(B, 1, D, H, W),
+            yy.expand(B, 1, D, H, W),
+            xx.expand(B, 1, D, H, W),
+        ],
+        dim=1,
+    )  # (B,3,D,H,W)
+
+    pred_sum = pred_w.sum(dim=(2, 3, 4), keepdim=True) + eps
+    gt_sum = gt_mask.sum(dim=(2, 3, 4), keepdim=True) + eps
+
+    pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4), keepdim=True) / pred_sum
+    gt_centroid = (gt_mask * coords).sum(dim=(2, 3, 4), keepdim=True) / gt_sum
+
+    pred_dist = torch.linalg.norm(coords - pred_centroid, dim=1, keepdim=True)
+    gt_dist = torch.linalg.norm(coords - gt_centroid, dim=1, keepdim=True)
+
+    pred_mean_dist = (pred_w * pred_dist).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+    gt_mean_dist = (gt_mask * gt_dist).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+
+    has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if not has_class.any():
+        return logits.new_tensor(0.0)
+
+    diff = pred_mean_dist[has_class] - gt_mean_dist[has_class]
+    return quadratic_penalty(diff.reshape(-1), torch.zeros_like(diff).reshape(-1)).mean()
+
+
 def plot_progress(workdir: Path):
     csv_path = workdir / "progress.csv"
     if not csv_path.exists():
@@ -353,10 +418,12 @@ def main(cfg_path: str):
 
     # centroid loss can apply to subset; default = desc_classes
     centroid_classes = as_int_list(cfg.get("centroid_classes", cfg.get("centroid_class", desc_classes)), default=desc_classes)
+    avgdist_classes = as_int_list(cfg.get("avgdist_classes", cfg.get("distance_classes", desc_classes)), default=desc_classes)
 
     shape_on = cfg.get("shape_on", "exp")  # "std" | "exp" | "both"
     lambda_volume = float(cfg.get("lambda_volume", 1.0))
     lambda_centroid = float(cfg.get("lambda_centroid", 1.0))
+    lambda_avgdist = float(cfg.get("lambda_avgdist", cfg.get("lambda_distance", 0.0)))
     centroid_norm = bool(cfg.get("centroid_norm", True))
 
     # training mode switches
@@ -384,6 +451,7 @@ def main(cfg_path: str):
         loss_sum_seg_bw = 0.0
         loss_sum_vol = 0.0
         loss_sum_cent = 0.0
+        loss_sum_avgdist = 0.0
         n_it = 0
 
         for i, batch in enumerate(train_loader):
@@ -426,6 +494,7 @@ def main(cfg_path: str):
 
                 vol_loss = logits.new_tensor(0.0)
                 cent_loss = logits.new_tensor(0.0)
+                avgdist_loss = logits.new_tensor(0.0)
 
                 if apply_shape:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
@@ -442,8 +511,22 @@ def main(cfg_path: str):
                                 )
                             )
                         cent_loss = torch.stack(cents).mean() if len(cents) > 0 else logits.new_tensor(0.0)
+                    if lambda_avgdist > 0.0 and len(avgdist_classes) > 0:
+                        avgdists = []
+                        for c in avgdist_classes:
+                            avgdists.append(
+                                compute_avg_distance_to_centroid_penalty(
+                                    logits, lbl_rs, cfg["n_classes"], c, centroid_norm=centroid_norm
+                                )
+                            )
+                        avgdist_loss = torch.stack(avgdists).mean() if len(avgdists) > 0 else logits.new_tensor(0.0)
 
-                total_loss = seg_loss_bw + lambda_volume * vol_loss + lambda_centroid * cent_loss
+                total_loss = (
+                    seg_loss_bw
+                    + lambda_volume * vol_loss
+                    + lambda_centroid * cent_loss
+                    + lambda_avgdist * avgdist_loss
+                )
                 if not total_loss.requires_grad:
                     # This happens for STD iterations when shape_on="exp" and use_seg_loss=False
                     # No gradient signal -> skip backward/step safely
@@ -458,6 +541,7 @@ def main(cfg_path: str):
             loss_sum_seg_bw += float(seg_loss_bw)
             loss_sum_vol += float(vol_loss)
             loss_sum_cent += float(cent_loss)
+            loss_sum_avgdist += float(avgdist_loss)
             n_it += 1
 
             if i % log_every == 0:
@@ -465,7 +549,7 @@ def main(cfg_path: str):
                     f"[E{epoch:03d} i{i:04d} {'EXP' if expanded else 'STD'}] "
                     f"tot={float(total_loss):.4f} "
                     f"seg(log)={float(seg_loss_logged):.4f} seg(bw)={float(seg_loss_bw):.4f} "
-                    f"vol={float(vol_loss):.4f} cent={float(cent_loss):.4f} "
+                    f"vol={float(vol_loss):.4f} cent={float(cent_loss):.4f} avgdist={float(avgdist_loss):.4f} "
                     f"lr={lr_now(opt):.2e}"
                 )
 
@@ -475,6 +559,7 @@ def main(cfg_path: str):
         loss_tr_seg_bw = loss_sum_seg_bw / max(1, n_it)
         loss_tr_vol = loss_sum_vol / max(1, n_it)
         loss_tr_cent = loss_sum_cent / max(1, n_it)
+        loss_tr_avgdist = loss_sum_avgdist / max(1, n_it)
 
         # validation (STD only; expanded=False), keep comparable metrics
         model.eval()
@@ -505,6 +590,7 @@ def main(cfg_path: str):
             "loss_tr_seg_bw": loss_tr_seg_bw,
             "loss_tr_vol": loss_tr_vol,
             "loss_tr_cent": loss_tr_cent,
+            "loss_tr_avgdist": loss_tr_avgdist,
             "loss_va_seg": loss_va_seg,
             "meanFGDice": meanFGDice,
             "lr": lr_now(opt),
