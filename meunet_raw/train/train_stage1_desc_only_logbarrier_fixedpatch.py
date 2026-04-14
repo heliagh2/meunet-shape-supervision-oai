@@ -749,17 +749,42 @@ def main(cfg_path: str):
             scaler.step(opt)
             scaler.update()
 
-            loss_sum_total += float(total_loss)
-            loss_sum_seg_logged += float(seg_loss_logged)
-            loss_sum_seg_bw += float(seg_loss_bw)
-            loss_sum_vol += float(vol_loss)
-            loss_sum_cent += float(cent_loss)
-            loss_sum_avgdist += float(avgdist_loss)
-            loss_sum_avgdist_axis += float(avgdist_axis_loss)
-            loss_sum_avgdist_axis_z += float(avgdist_axis_stats[0])
-            loss_sum_avgdist_axis_y += float(avgdist_axis_stats[1])
-            loss_sum_avgdist_axis_x += float(avgdist_axis_stats[2])
+            total_loss_v = float(total_loss.detach())
+            seg_loss_logged_v = float(seg_loss_logged.detach())
+            seg_loss_bw_v = float(seg_loss_bw.detach())
+            vol_loss_v = float(vol_loss.detach())
+            cent_loss_v = float(cent_loss.detach())
+            avgdist_loss_v = float(avgdist_loss.detach())
+            avgdist_axis_loss_v = float(avgdist_axis_loss.detach())
+            avgdist_axis_z_v = float(avgdist_axis_stats[0].detach())
+            avgdist_axis_y_v = float(avgdist_axis_stats[1].detach())
+            avgdist_axis_x_v = float(avgdist_axis_stats[2].detach())
+
+            loss_sum_total += total_loss_v
+            loss_sum_seg_logged += seg_loss_logged_v
+            loss_sum_seg_bw += seg_loss_bw_v
+            loss_sum_vol += vol_loss_v
+            loss_sum_cent += cent_loss_v
+            loss_sum_avgdist += avgdist_loss_v
+            loss_sum_avgdist_axis += avgdist_axis_loss_v
+            loss_sum_avgdist_axis_z += avgdist_axis_z_v
+            loss_sum_avgdist_axis_y += avgdist_axis_y_v
+            loss_sum_avgdist_axis_x += avgdist_axis_x_v
             n_it += 1
+
+            if i % log_every == 0:
+                print(
+                    f"[E{epoch:03d} i{i:04d} {'EXP' if expanded else 'STD'}] "
+                    f"tot={total_loss_v:.4f} "
+                    f"seg(log)={seg_loss_logged_v:.4f} "
+                    f"seg(bw)={seg_loss_bw_v:.4f} "
+                    f"vol={vol_loss_v:.4f} "
+                    f"cent={cent_loss_v:.4f} "
+                    f"avgdist={avgdist_loss_v:.4f} "
+                    f"avgdist_axis={avgdist_axis_loss_v:.4f} "
+                    f"t={barrier_t:.2f} "
+                    f"lr={lr_now(opt):.2e}"
+                )
 
             # Drop large per-iteration tensors before the next forward to reduce memory
             del out
@@ -775,20 +800,6 @@ def main(cfg_path: str):
             del img
             del lbl
             del batch
-
-            if i % log_every == 0:
-                print(
-                    f"[E{epoch:03d} i{i:04d} {'EXP' if expanded else 'STD'}] "
-                    f"tot={float(total_loss):.4f} "
-                    f"seg(log)={float(seg_loss_logged):.4f} "
-                    f"seg(bw)={float(seg_loss_bw):.4f} "
-                    f"vol={float(vol_loss):.4f} "
-                    f"cent={float(cent_loss):.4f} "
-                    f"avgdist={float(avgdist_loss):.4f} "
-                    f"avgdist_axis={float(avgdist_axis_loss):.4f} "
-                    f"t={barrier_t:.2f} "
-                    f"lr={lr_now(opt):.2e}"
-                )
 
         # epoch averages
         loss_tr_total = loss_sum_total / max(1, n_it)
