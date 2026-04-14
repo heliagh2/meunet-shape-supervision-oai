@@ -307,6 +307,225 @@ def compute_centroid_barrier(
     return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
 
 
+def compute_avgdist_barrier(
+    logits,
+    target,
+    n_classes,
+    distance_class,
+    barrier: LogBarrierLoss,
+    avgdist_tolerance=0.10,
+    centroid_norm=True,
+    ignore_index=-1,
+    eps=1e-6,
+):
+    """
+    Enforce:
+        gt_avgdist - tol <= pred_avgdist <= gt_avgdist + tol
+
+    where avgdist is the mean Euclidean distance to the class centroid.
+    """
+    device = logits.device
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index).float().unsqueeze(1)
+
+    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
+    one_hot = one_hot.to(device)
+
+    pred_w = probs[:, distance_class:distance_class+1] * valid
+    gt_mask = one_hot[:, distance_class:distance_class+1] * valid
+
+    B, _, D, H, W = pred_w.shape
+
+    if centroid_norm:
+        zz = torch.linspace(0, 1, D, device=device).view(1, 1, D, 1, 1)
+        yy = torch.linspace(0, 1, H, device=device).view(1, 1, 1, H, 1)
+        xx = torch.linspace(0, 1, W, device=device).view(1, 1, 1, 1, W)
+    else:
+        zz = torch.arange(D, device=device).float().view(1, 1, D, 1, 1)
+        yy = torch.arange(H, device=device).float().view(1, 1, 1, H, 1)
+        xx = torch.arange(W, device=device).float().view(1, 1, 1, 1, W)
+
+    coords = torch.cat(
+        [
+            zz.expand(B, 1, D, H, W),
+            yy.expand(B, 1, D, H, W),
+            xx.expand(B, 1, D, H, W),
+        ],
+        dim=1,
+    )
+
+    pred_sum = pred_w.sum(dim=(2, 3, 4), keepdim=True) + eps
+    gt_sum = gt_mask.sum(dim=(2, 3, 4), keepdim=True) + eps
+
+    pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4), keepdim=True) / pred_sum
+    gt_centroid = (gt_mask * coords).sum(dim=(2, 3, 4), keepdim=True) / gt_sum
+
+    pred_dist = torch.linalg.norm(coords - pred_centroid, dim=1, keepdim=True)
+    gt_dist = torch.linalg.norm(coords - gt_centroid, dim=1, keepdim=True)
+
+    pred_avgdist = (pred_w * pred_dist).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+    gt_avgdist = (gt_mask * gt_dist).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+
+    has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if not has_class.any():
+        return logits.new_tensor(0.0)
+
+    pred_d = pred_avgdist[has_class]
+    gt_d = gt_avgdist[has_class]
+
+    upper = gt_d + avgdist_tolerance
+    lower = gt_d - avgdist_tolerance
+
+    z_upper = pred_d - upper
+    z_lower = lower - pred_d
+
+    return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
+
+
+def compute_avgdist_axis_barrier(
+    logits,
+    target,
+    n_classes,
+    distance_class,
+    barrier: LogBarrierLoss,
+    avgdist_axis_tolerance=0.05,
+    centroid_norm=True,
+    ignore_index=-1,
+    eps=1e-6,
+):
+    """
+    Enforce:
+        gt_axis_spread - tol <= pred_axis_spread <= gt_axis_spread + tol
+
+    where axis_spread is computed per axis as sqrt(E[(coord - centroid_coord)^2]).
+    """
+    device = logits.device
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index).float().unsqueeze(1)
+
+    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
+    one_hot = one_hot.to(device)
+
+    pred_w = probs[:, distance_class:distance_class+1] * valid
+    gt_mask = one_hot[:, distance_class:distance_class+1] * valid
+
+    B, _, D, H, W = pred_w.shape
+
+    if centroid_norm:
+        zz = torch.linspace(0, 1, D, device=device).view(1, 1, D, 1, 1)
+        yy = torch.linspace(0, 1, H, device=device).view(1, 1, 1, H, 1)
+        xx = torch.linspace(0, 1, W, device=device).view(1, 1, 1, 1, W)
+    else:
+        zz = torch.arange(D, device=device).float().view(1, 1, D, 1, 1)
+        yy = torch.arange(H, device=device).float().view(1, 1, 1, H, 1)
+        xx = torch.arange(W, device=device).float().view(1, 1, 1, 1, W)
+
+    grids = [zz.expand(B, 1, D, H, W), yy.expand(B, 1, D, H, W), xx.expand(B, 1, D, H, W)]
+    coords = torch.cat(grids, dim=1)
+
+    pred_sum = pred_w.sum(dim=(2, 3, 4), keepdim=True) + eps
+    gt_sum = gt_mask.sum(dim=(2, 3, 4), keepdim=True) + eps
+
+    pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4), keepdim=True) / pred_sum
+    gt_centroid = (gt_mask * coords).sum(dim=(2, 3, 4), keepdim=True) / gt_sum
+
+    pred_axis_spreads = []
+    gt_axis_spreads = []
+    for axis_grid, pred_c_axis, gt_c_axis in zip(
+        grids,
+        pred_centroid.split(1, dim=1),
+        gt_centroid.split(1, dim=1),
+    ):
+        pred_axis_var = (pred_w * (axis_grid - pred_c_axis) ** 2).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+        gt_axis_var = (gt_mask * (axis_grid - gt_c_axis) ** 2).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+        pred_axis_spreads.append(torch.sqrt(pred_axis_var + eps))
+        gt_axis_spreads.append(torch.sqrt(gt_axis_var + eps))
+
+    pred_spread = torch.stack(pred_axis_spreads, dim=1)
+    gt_spread = torch.stack(gt_axis_spreads, dim=1)
+
+    has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if not has_class.any():
+        return logits.new_tensor(0.0)
+
+    pred_s = pred_spread[has_class]
+    gt_s = gt_spread[has_class]
+
+    upper = gt_s + avgdist_axis_tolerance
+    lower = gt_s - avgdist_axis_tolerance
+
+    z_upper = pred_s - upper
+    z_lower = lower - pred_s
+
+    return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
+
+
+def compute_avgdist_axis_stats(
+    logits,
+    target,
+    n_classes,
+    distance_class,
+    centroid_norm=True,
+    ignore_index=-1,
+    eps=1e-6,
+):
+    """
+    Return mean absolute per-axis spread error between prediction and GT.
+    Output shape: (3,) for (z, y, x).
+    """
+    device = logits.device
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index).float().unsqueeze(1)
+
+    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
+    one_hot = one_hot.to(device)
+
+    pred_w = probs[:, distance_class:distance_class+1] * valid
+    gt_mask = one_hot[:, distance_class:distance_class+1] * valid
+
+    B, _, D, H, W = pred_w.shape
+
+    if centroid_norm:
+        zz = torch.linspace(0, 1, D, device=device).view(1, 1, D, 1, 1)
+        yy = torch.linspace(0, 1, H, device=device).view(1, 1, 1, H, 1)
+        xx = torch.linspace(0, 1, W, device=device).view(1, 1, 1, 1, W)
+    else:
+        zz = torch.arange(D, device=device).float().view(1, 1, D, 1, 1)
+        yy = torch.arange(H, device=device).float().view(1, 1, 1, H, 1)
+        xx = torch.arange(W, device=device).float().view(1, 1, 1, 1, W)
+
+    grids = [zz.expand(B, 1, D, H, W), yy.expand(B, 1, D, H, W), xx.expand(B, 1, D, H, W)]
+    coords = torch.cat(grids, dim=1)
+
+    pred_sum = pred_w.sum(dim=(2, 3, 4), keepdim=True) + eps
+    gt_sum = gt_mask.sum(dim=(2, 3, 4), keepdim=True) + eps
+
+    pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4), keepdim=True) / pred_sum
+    gt_centroid = (gt_mask * coords).sum(dim=(2, 3, 4), keepdim=True) / gt_sum
+
+    pred_axis_spreads = []
+    gt_axis_spreads = []
+    for axis_grid, pred_c_axis, gt_c_axis in zip(
+        grids,
+        pred_centroid.split(1, dim=1),
+        gt_centroid.split(1, dim=1),
+    ):
+        pred_axis_var = (pred_w * (axis_grid - pred_c_axis) ** 2).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+        gt_axis_var = (gt_mask * (axis_grid - gt_c_axis) ** 2).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+        pred_axis_spreads.append(torch.sqrt(pred_axis_var + eps))
+        gt_axis_spreads.append(torch.sqrt(gt_axis_var + eps))
+
+    pred_spread = torch.stack(pred_axis_spreads, dim=1)
+    gt_spread = torch.stack(gt_axis_spreads, dim=1)
+
+    has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if not has_class.any():
+        return logits.new_zeros(3)
+
+    abs_err = (pred_spread[has_class] - gt_spread[has_class]).abs()
+    return abs_err.mean(dim=0)
+
+
 # plotting
 
 def plot_progress(workdir: Path):
@@ -416,11 +635,15 @@ def main(cfg_path: str):
     desc_classes = as_int_list(cfg.get("desc_only_classes", cfg.get("desc_only_class", [1])))
     volume_classes = as_int_list(cfg.get("volume_classes", desc_classes), default=desc_classes)
     centroid_classes = as_int_list(cfg.get("centroid_classes", cfg.get("centroid_class", desc_classes)), default=desc_classes)
+    avgdist_classes = as_int_list(cfg.get("avgdist_classes", cfg.get("distance_classes", desc_classes)), default=desc_classes)
+    avgdist_axis_classes = as_int_list(cfg.get("avgdist_axis_classes", cfg.get("distance_axis_classes", desc_classes)), default=desc_classes)
 
     shape_on = cfg.get("shape_on", "exp")  # "std" | "exp" | "both"
 
     lambda_volume = float(cfg.get("lambda_volume", 1.0))
     lambda_centroid = float(cfg.get("lambda_centroid", 1.0))
+    lambda_avgdist = float(cfg.get("lambda_avgdist", cfg.get("lambda_distance", 0.0)))
+    lambda_avgdist_axis = float(cfg.get("lambda_avgdist_axis", cfg.get("lambda_distance_axis", 0.0)))
 
     centroid_norm = bool(cfg.get("centroid_norm", True))
 
@@ -428,6 +651,8 @@ def main(cfg_path: str):
     barrier_t = float(cfg.get("barrier_t", 5.0))
     volume_tolerance = float(cfg.get("volume_tolerance", 0.10))
     centroid_tolerance = float(cfg.get("centroid_tolerance", 0.05))
+    avgdist_tolerance = float(cfg.get("avgdist_tolerance", 0.05))
+    avgdist_axis_tolerance = float(cfg.get("avgdist_axis_tolerance", 0.05))
     barrier = LogBarrierLoss(t=barrier_t)
 
     # training mode switches
@@ -454,6 +679,11 @@ def main(cfg_path: str):
         loss_sum_seg_bw = 0.0
         loss_sum_vol = 0.0
         loss_sum_cent = 0.0
+        loss_sum_avgdist = 0.0
+        loss_sum_avgdist_axis = 0.0
+        loss_sum_avgdist_axis_z = 0.0
+        loss_sum_avgdist_axis_y = 0.0
+        loss_sum_avgdist_axis_x = 0.0
         n_it = 0
 
         for i, batch in enumerate(train_loader):
@@ -495,6 +725,9 @@ def main(cfg_path: str):
 
                 vol_loss = logits.new_tensor(0.0)
                 cent_loss = logits.new_tensor(0.0)
+                avgdist_loss = logits.new_tensor(0.0)
+                avgdist_axis_loss = logits.new_tensor(0.0)
+                avgdist_axis_stats = logits.new_zeros(3)
 
                 if apply_shape:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
@@ -523,7 +756,60 @@ def main(cfg_path: str):
                             )
                         cent_loss = torch.stack(cents).mean() if len(cents) > 0 else logits.new_tensor(0.0)
 
-                total_loss = seg_loss_bw + lambda_volume * vol_loss + lambda_centroid * cent_loss
+                    if lambda_avgdist > 0.0 and len(avgdist_classes) > 0:
+                        avgdists = []
+                        for c in avgdist_classes:
+                            avgdists.append(
+                                compute_avgdist_barrier(
+                                    logits=logits,
+                                    target=lbl_rs,
+                                    n_classes=cfg["n_classes"],
+                                    distance_class=c,
+                                    barrier=barrier,
+                                    avgdist_tolerance=avgdist_tolerance,
+                                    centroid_norm=centroid_norm,
+                                )
+                            )
+                        avgdist_loss = torch.stack(avgdists).mean() if len(avgdists) > 0 else logits.new_tensor(0.0)
+
+                    if lambda_avgdist_axis > 0.0 and len(avgdist_axis_classes) > 0:
+                        avgdist_axes = []
+                        avgdist_axis_stats_all = []
+                        for c in avgdist_axis_classes:
+                            avgdist_axes.append(
+                                compute_avgdist_axis_barrier(
+                                    logits=logits,
+                                    target=lbl_rs,
+                                    n_classes=cfg["n_classes"],
+                                    distance_class=c,
+                                    barrier=barrier,
+                                    avgdist_axis_tolerance=avgdist_axis_tolerance,
+                                    centroid_norm=centroid_norm,
+                                )
+                            )
+                            avgdist_axis_stats_all.append(
+                                compute_avgdist_axis_stats(
+                                    logits=logits,
+                                    target=lbl_rs,
+                                    n_classes=cfg["n_classes"],
+                                    distance_class=c,
+                                    centroid_norm=centroid_norm,
+                                )
+                            )
+                        avgdist_axis_loss = torch.stack(avgdist_axes).mean() if len(avgdist_axes) > 0 else logits.new_tensor(0.0)
+                        avgdist_axis_stats = (
+                            torch.stack(avgdist_axis_stats_all).mean(dim=0)
+                            if len(avgdist_axis_stats_all) > 0
+                            else logits.new_zeros(3)
+                        )
+
+                total_loss = (
+                    seg_loss_bw
+                    + lambda_volume * vol_loss
+                    + lambda_centroid * cent_loss
+                    + lambda_avgdist * avgdist_loss
+                    + lambda_avgdist_axis * avgdist_axis_loss
+                )
 
                 if not total_loss.requires_grad:
                     continue
@@ -537,6 +823,11 @@ def main(cfg_path: str):
             loss_sum_seg_bw += float(seg_loss_bw)
             loss_sum_vol += float(vol_loss)
             loss_sum_cent += float(cent_loss)
+            loss_sum_avgdist += float(avgdist_loss)
+            loss_sum_avgdist_axis += float(avgdist_axis_loss)
+            loss_sum_avgdist_axis_z += float(avgdist_axis_stats[0])
+            loss_sum_avgdist_axis_y += float(avgdist_axis_stats[1])
+            loss_sum_avgdist_axis_x += float(avgdist_axis_stats[2])
             n_it += 1
 
             if i % log_every == 0:
@@ -547,6 +838,8 @@ def main(cfg_path: str):
                     f"seg(bw)={float(seg_loss_bw):.4f} "
                     f"vol={float(vol_loss):.4f} "
                     f"cent={float(cent_loss):.4f} "
+                    f"avgdist={float(avgdist_loss):.4f} "
+                    f"avgdist_axis={float(avgdist_axis_loss):.4f} "
                     f"t={barrier_t:.2f} "
                     f"lr={lr_now(opt):.2e}"
                 )
@@ -557,6 +850,11 @@ def main(cfg_path: str):
         loss_tr_seg_bw = loss_sum_seg_bw / max(1, n_it)
         loss_tr_vol = loss_sum_vol / max(1, n_it)
         loss_tr_cent = loss_sum_cent / max(1, n_it)
+        loss_tr_avgdist = loss_sum_avgdist / max(1, n_it)
+        loss_tr_avgdist_axis = loss_sum_avgdist_axis / max(1, n_it)
+        loss_tr_avgdist_axis_z = loss_sum_avgdist_axis_z / max(1, n_it)
+        loss_tr_avgdist_axis_y = loss_sum_avgdist_axis_y / max(1, n_it)
+        loss_tr_avgdist_axis_x = loss_sum_avgdist_axis_x / max(1, n_it)
 
         # validation (STD only)
         model.eval()
@@ -587,6 +885,11 @@ def main(cfg_path: str):
             "loss_tr_seg_bw": loss_tr_seg_bw,
             "loss_tr_vol": loss_tr_vol,
             "loss_tr_cent": loss_tr_cent,
+            "loss_tr_avgdist": loss_tr_avgdist,
+            "loss_tr_avgdist_axis": loss_tr_avgdist_axis,
+            "loss_tr_avgdist_axis_z": loss_tr_avgdist_axis_z,
+            "loss_tr_avgdist_axis_y": loss_tr_avgdist_axis_y,
+            "loss_tr_avgdist_axis_x": loss_tr_avgdist_axis_x,
             "loss_va_seg": loss_va_seg,
             "meanFGDice": meanFGDice,
             "lr": lr_now(opt),
@@ -595,6 +898,8 @@ def main(cfg_path: str):
             "barrier_t": barrier_t,
             "volume_tolerance": volume_tolerance,
             "centroid_tolerance": centroid_tolerance,
+            "avgdist_tolerance": avgdist_tolerance,
+            "avgdist_axis_tolerance": avgdist_axis_tolerance,
         }
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
@@ -633,6 +938,9 @@ def main(cfg_path: str):
             f"seg(bw)={loss_tr_seg_bw:.4f} "
             f"vol={loss_tr_vol:.4f} "
             f"cent={loss_tr_cent:.4f} | "
+            f"avgdist={loss_tr_avgdist:.4f} "
+            f"avgdist_axis={loss_tr_avgdist_axis:.4f} "
+            f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
             f"val seg={loss_va_seg:.4f} "
             f"meanFGDice={meanFGDice:.4f} | "
             f"best={best_metric:.4f} "

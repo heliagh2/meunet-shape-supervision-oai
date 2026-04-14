@@ -5,9 +5,9 @@
 # dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
 
 # data
-images_dir: /projects/prjs1722/oai_baselines/nnunet/nnUNet_raw/Dataset701_OAIKnee/imagesTr
-labels_dir: /projects/prjs1722/oai_baselines/nnunet/nnUNet_raw/Dataset701_OAIKnee/labelsTr
-splits_file: /projects/prjs1722/oai_baselines/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
 dataset_name: Dataset701_OAIKnee
 
 classes: [0, 1, 2, 3, 4]
@@ -53,16 +53,22 @@ detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
 desc_only_classes: [1, 2, 3, 4]
 centroid_classes: [1, 2, 3, 4]
 volume_classes: [1, 2, 3, 4]
+avgdist_classes: [1, 2, 3, 4]
+avgdist_axis_classes: [1, 2, 3, 4]
 shape_on: both                  # apply shape losses on EXP and STD patches
 
 lambda_volume: 1.0              # small now for first experiment logbarrier
 lambda_centroid: 5.0            # small now for first experiment logbarrier
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
 #logbarrier toggles
 barrier_t: 5.0
 volume_tolerance: 0.10
 centroid_tolerance: 0.05
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.05
 
 
-workdir: /projects/prjs1722/oai_baselines/meunet_raw/results/stage1_desc_only_all_both_best_logbarrier_centx5_fixedpatch
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/stage1_desc_only_all_both_best_logbarrier_centx5_fixedpatch

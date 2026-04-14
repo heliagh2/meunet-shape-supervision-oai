@@ -8,6 +8,26 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
+def _strip_nii_suffix(name: str) -> str:
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    if name.endswith(".nii"):
+        return name[:-4]
+    return name
+
+
+def _resolve_case_file(directory: Path, stem: str, suffixes) -> Path:
+    for suffix in suffixes:
+        for ext in (".nii.gz", ".nii"):
+            candidate = directory / f"{stem}{suffix}{ext}"
+            if candidate.exists():
+                return candidate
+    raise FileNotFoundError(
+        f"Could not find file for stem '{stem}' in {directory}. "
+        f"Tried suffixes: {list(suffixes)}"
+    )
+
+
 def zscore_nonzero(vol: np.ndarray) -> np.ndarray:
     """
     Per-volume z-score on non-zero voxels, like in inference.
@@ -165,6 +185,8 @@ class OAIPairedPatch(Dataset):
         self.expand_factor = float(expand_factor) if expand_factor is not None else None
         self.fg_sampling_prob = float(fg_sampling_prob)  # not used, kept for compatibility
         self.train = bool(train)
+        self.image_suffixes = ("_0000", "")
+        self.label_suffixes = ("", "_segmentation")
 
         # Precompute ONE fixed center per case
         self.fixed_centers = {}
@@ -174,13 +196,8 @@ class OAIPairedPatch(Dataset):
         return len(self.stems)
 
     def _load_case(self, stem: str):
-        img_path = self.images_dir / f"{stem}_0000.nii.gz"
-        lbl_path = self.labels_dir / f"{stem}.nii.gz"
-
-        if not img_path.exists():
-            raise FileNotFoundError(f"Image not found for stem {stem}: {img_path}")
-        if not lbl_path.exists():
-            raise FileNotFoundError(f"Label not found for stem {stem}: {lbl_path}")
+        img_path = _resolve_case_file(self.images_dir, stem, self.image_suffixes)
+        lbl_path = _resolve_case_file(self.labels_dir, stem, self.label_suffixes)
 
         img_nii = nib.load(str(img_path))
         lbl_nii = nib.load(str(lbl_path))
@@ -268,4 +285,6 @@ def load_splits(cfg):
             f"Could not find 'train'/'val' keys in split entry: keys={list(split.keys())}"
         )
 
-    return list(train_ids), list(val_ids)
+    train_ids = [_strip_nii_suffix(str(case_id)) for case_id in train_ids]
+    val_ids = [_strip_nii_suffix(str(case_id)) for case_id in val_ids]
+    return train_ids, val_ids

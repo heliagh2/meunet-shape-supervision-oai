@@ -19,6 +19,24 @@ if str(ROOT) not in sys.path:
 from models.meunet3d import MEUNet3D
 
 
+def _strip_nii_suffix(name: str) -> str:
+    if name.endswith(".nii.gz"):
+        return name[:-7]
+    if name.endswith(".nii"):
+        return name[:-4]
+    return name
+
+
+def normalize_case_id(path_or_name: str) -> str:
+    name = Path(path_or_name).name
+    stem = _strip_nii_suffix(name)
+    if stem.endswith("_0000"):
+        stem = stem[:-5]
+    if stem.endswith("_segmentation"):
+        stem = stem[:-13]
+    return stem
+
+
 def load_config(cfg_path):
     cfg_path = Path(cfg_path)
     if cfg_path.suffix == ".json":
@@ -46,6 +64,63 @@ def preprocess_volume(vol: np.ndarray):
         s = 1.0
     vol = (vol - m) / s
     return vol
+
+
+def load_or_create_test_split(cfg, images_dir: Path):
+    splits_file = cfg.get("splits_file")
+    if splits_file is None:
+        return None
+
+    splits_path = Path(splits_file)
+    split_dir = splits_path.parent
+    test_split_path = split_dir / "splits_test_final.json"
+
+    img_paths = sorted(p for p in images_dir.glob("*.nii*"))
+    image_ids = sorted({normalize_case_id(p.name) for p in img_paths})
+
+    if test_split_path.exists():
+        with open(test_split_path, "r") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            test_ids = data.get("test") or data.get("test_ids") or data.get("test_keys")
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            split = data[int(cfg.get("split", 0))]
+            test_ids = split.get("test") or split.get("test_ids") or split.get("test_keys")
+        else:
+            test_ids = data
+
+        if test_ids is None:
+            raise KeyError(f"Could not find test ids in {test_split_path}")
+
+        test_ids = [normalize_case_id(str(case_id)) for case_id in test_ids]
+        print(f"[INFO] Using existing test split from {test_split_path} ({len(test_ids)} ids)")
+        return test_ids
+
+    with open(splits_path, "r") as f:
+        splits = json.load(f)
+
+    split_idx = int(cfg.get("split", 0))
+    if split_idx < 0 or split_idx >= len(splits):
+        raise IndexError(
+            f"split index {split_idx} out of range for splits_file with {len(splits)} entries"
+        )
+
+    split = splits[split_idx]
+    train_ids = split.get("train") or split.get("train_ids") or split.get("train_keys") or []
+    val_ids = split.get("val") or split.get("val_ids") or split.get("val_keys") or []
+    trainval_ids = {normalize_case_id(str(case_id)) for case_id in list(train_ids) + list(val_ids)}
+
+    test_ids = sorted(case_id for case_id in image_ids if case_id not in trainval_ids)
+
+    with open(test_split_path, "w") as f:
+        json.dump({"test": test_ids}, f, indent=2)
+
+    print(
+        f"[INFO] Created {test_split_path} with {len(test_ids)} ids "
+        f"from {len(image_ids)} images not present in train/val split."
+    )
+    return test_ids
 
 
 @torch.no_grad()
@@ -102,6 +177,15 @@ def main():
     img_paths = sorted(p for p in images_dir.glob("*.nii*"))
     if not img_paths:
         raise RuntimeError(f"No NIfTI files found in {images_dir}")
+
+    test_ids = load_or_create_test_split(cfg, images_dir)
+    if test_ids is not None:
+        test_set = set(test_ids)
+        img_paths = [p for p in img_paths if normalize_case_id(p.name) in test_set]
+        if not img_paths:
+            raise RuntimeError(
+                f"No test images left in {images_dir} after filtering by splits_test_final.json logic."
+            )
 
     print(f"[INFO] Running stage-1 inference on {len(img_paths)} volumes from {images_dir}")
     for i, img_path in enumerate(img_paths, 1):
