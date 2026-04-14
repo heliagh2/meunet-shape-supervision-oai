@@ -392,6 +392,7 @@ def compute_avgdist_axis_barrier(
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    return_stats=False,
 ):
     """
     Enforce:
@@ -421,109 +422,47 @@ def compute_avgdist_axis_barrier(
         xx = torch.arange(W, device=device).float().view(1, 1, 1, 1, W)
 
     grids = [zz.expand(B, 1, D, H, W), yy.expand(B, 1, D, H, W), xx.expand(B, 1, D, H, W)]
-    coords = torch.cat(grids, dim=1)
 
     pred_sum = pred_w.sum(dim=(2, 3, 4), keepdim=True) + eps
     gt_sum = gt_mask.sum(dim=(2, 3, 4), keepdim=True) + eps
 
-    pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4), keepdim=True) / pred_sum
-    gt_centroid = (gt_mask * coords).sum(dim=(2, 3, 4), keepdim=True) / gt_sum
-
-    pred_axis_spreads = []
-    gt_axis_spreads = []
-    for axis_grid, pred_c_axis, gt_c_axis in zip(
-        grids,
-        pred_centroid.split(1, dim=1),
-        gt_centroid.split(1, dim=1),
-    ):
-        pred_axis_var = (pred_w * (axis_grid - pred_c_axis) ** 2).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
-        gt_axis_var = (gt_mask * (axis_grid - gt_c_axis) ** 2).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
-        pred_axis_spreads.append(torch.sqrt(pred_axis_var + eps))
-        gt_axis_spreads.append(torch.sqrt(gt_axis_var + eps))
-
-    pred_spread = torch.stack(pred_axis_spreads, dim=1)
-    gt_spread = torch.stack(gt_axis_spreads, dim=1)
+    pred_centroids = [(pred_w * axis_grid).sum(dim=(2, 3, 4), keepdim=True) / pred_sum for axis_grid in grids]
+    gt_centroids = [(gt_mask * axis_grid).sum(dim=(2, 3, 4), keepdim=True) / gt_sum for axis_grid in grids]
 
     has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
     if not has_class.any():
+        if return_stats:
+            return logits.new_tensor(0.0), logits.new_zeros(3)
         return logits.new_tensor(0.0)
 
-    pred_s = pred_spread[has_class]
-    gt_s = gt_spread[has_class]
-
-    upper = gt_s + avgdist_axis_tolerance
-    lower = gt_s - avgdist_axis_tolerance
-
-    z_upper = pred_s - upper
-    z_lower = lower - pred_s
-
-    return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
-
-
-def compute_avgdist_axis_stats(
-    logits,
-    target,
-    n_classes,
-    distance_class,
-    centroid_norm=True,
-    ignore_index=-1,
-    eps=1e-6,
-):
-    """
-    Return mean absolute per-axis spread error between prediction and GT.
-    Output shape: (3,) for (z, y, x).
-    """
-    device = logits.device
-    probs = F.softmax(logits.float(), dim=1)
-    valid = (target != ignore_index).float().unsqueeze(1)
-
-    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
-    one_hot = one_hot.to(device)
-
-    pred_w = probs[:, distance_class:distance_class+1] * valid
-    gt_mask = one_hot[:, distance_class:distance_class+1] * valid
-
-    B, _, D, H, W = pred_w.shape
-
-    if centroid_norm:
-        zz = torch.linspace(0, 1, D, device=device).view(1, 1, D, 1, 1)
-        yy = torch.linspace(0, 1, H, device=device).view(1, 1, 1, H, 1)
-        xx = torch.linspace(0, 1, W, device=device).view(1, 1, 1, 1, W)
-    else:
-        zz = torch.arange(D, device=device).float().view(1, 1, D, 1, 1)
-        yy = torch.arange(H, device=device).float().view(1, 1, 1, H, 1)
-        xx = torch.arange(W, device=device).float().view(1, 1, 1, 1, W)
-
-    grids = [zz.expand(B, 1, D, H, W), yy.expand(B, 1, D, H, W), xx.expand(B, 1, D, H, W)]
-    coords = torch.cat(grids, dim=1)
-
-    pred_sum = pred_w.sum(dim=(2, 3, 4), keepdim=True) + eps
-    gt_sum = gt_mask.sum(dim=(2, 3, 4), keepdim=True) + eps
-
-    pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4), keepdim=True) / pred_sum
-    gt_centroid = (gt_mask * coords).sum(dim=(2, 3, 4), keepdim=True) / gt_sum
-
-    pred_axis_spreads = []
-    gt_axis_spreads = []
-    for axis_grid, pred_c_axis, gt_c_axis in zip(
-        grids,
-        pred_centroid.split(1, dim=1),
-        gt_centroid.split(1, dim=1),
-    ):
+    barrier_loss = logits.new_tensor(0.0)
+    axis_stats = []
+    for axis_grid, pred_c_axis, gt_c_axis in zip(grids, pred_centroids, gt_centroids):
         pred_axis_var = (pred_w * (axis_grid - pred_c_axis) ** 2).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
         gt_axis_var = (gt_mask * (axis_grid - gt_c_axis) ** 2).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
-        pred_axis_spreads.append(torch.sqrt(pred_axis_var + eps))
-        gt_axis_spreads.append(torch.sqrt(gt_axis_var + eps))
+        pred_s = torch.sqrt(pred_axis_var + eps)[has_class]
+        gt_s = torch.sqrt(gt_axis_var + eps)[has_class]
 
-    pred_spread = torch.stack(pred_axis_spreads, dim=1)
-    gt_spread = torch.stack(gt_axis_spreads, dim=1)
+        upper = gt_s + avgdist_axis_tolerance
+        lower = gt_s - avgdist_axis_tolerance
 
-    has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
-    if not has_class.any():
-        return logits.new_zeros(3)
+        z_upper = pred_s - upper
+        z_lower = lower - pred_s
+        barrier_loss = barrier_loss + barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
 
-    abs_err = (pred_spread[has_class] - gt_spread[has_class]).abs()
-    return abs_err.mean(dim=0)
+        if return_stats:
+            axis_stats.append((pred_s - gt_s).abs().mean())
+
+        del pred_axis_var
+        del gt_axis_var
+        del pred_s
+        del gt_s
+        del z_upper
+        del z_lower
+
+    if return_stats:
+        return barrier_loss, torch.stack(axis_stats)
+    return barrier_loss
 
 
 # plotting
@@ -776,8 +715,7 @@ def main(cfg_path: str):
                         avgdist_axes = []
                         avgdist_axis_stats_all = []
                         for c in avgdist_axis_classes:
-                            avgdist_axes.append(
-                                compute_avgdist_axis_barrier(
+                            axis_loss_c, axis_stats_c = compute_avgdist_axis_barrier(
                                     logits=logits,
                                     target=lbl_rs,
                                     n_classes=cfg["n_classes"],
@@ -785,17 +723,10 @@ def main(cfg_path: str):
                                     barrier=barrier,
                                     avgdist_axis_tolerance=avgdist_axis_tolerance,
                                     centroid_norm=centroid_norm,
+                                    return_stats=True,
                                 )
-                            )
-                            avgdist_axis_stats_all.append(
-                                compute_avgdist_axis_stats(
-                                    logits=logits,
-                                    target=lbl_rs,
-                                    n_classes=cfg["n_classes"],
-                                    distance_class=c,
-                                    centroid_norm=centroid_norm,
-                                )
-                            )
+                            avgdist_axes.append(axis_loss_c)
+                            avgdist_axis_stats_all.append(axis_stats_c)
                         avgdist_axis_loss = torch.stack(avgdist_axes).mean() if len(avgdist_axes) > 0 else logits.new_tensor(0.0)
                         avgdist_axis_stats = (
                             torch.stack(avgdist_axis_stats_all).mean(dim=0)
@@ -829,6 +760,21 @@ def main(cfg_path: str):
             loss_sum_avgdist_axis_y += float(avgdist_axis_stats[1])
             loss_sum_avgdist_axis_x += float(avgdist_axis_stats[2])
             n_it += 1
+
+            # Drop large per-iteration tensors before the next forward to reduce memory
+            del out
+            del logits
+            del lbl_rs
+            del seg_loss_logged
+            del seg_loss_bw
+            del vol_loss
+            del cent_loss
+            del avgdist_loss
+            del avgdist_axis_loss
+            del avgdist_axis_stats
+            del img
+            del lbl
+            del batch
 
             if i % log_every == 0:
                 print(
