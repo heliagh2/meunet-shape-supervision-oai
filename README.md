@@ -1,4 +1,4 @@
-# MEUNet Stage-1 — OAI Knee MRI
+# meU-Net Stage-1 — OAI Knee MRI
 
 Descriptor-Only Supervision (Volume + Centroid)
 
