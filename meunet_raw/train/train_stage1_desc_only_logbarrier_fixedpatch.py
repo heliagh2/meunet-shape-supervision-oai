@@ -25,6 +25,11 @@ import matplotlib.pyplot as plt
 from data.dataset_oai_raw_fixedpatch import OAIPairedPatch, load_splits
 from models.meunet3d import MEUNet3D
 from losses.dice_ce import DiceCELoss
+from losses.moment_invariants import (
+    compute_2nd_moment_barrier,
+    compute_3rd_moment_barrier,
+    compute_moment_invariants_barrier,
+)
 
 
 # helpers
@@ -576,6 +581,9 @@ def main(cfg_path: str):
     centroid_classes = as_int_list(cfg.get("centroid_classes", cfg.get("centroid_class", desc_classes)), default=desc_classes)
     avgdist_classes = as_int_list(cfg.get("avgdist_classes", cfg.get("distance_classes", desc_classes)), default=desc_classes)
     avgdist_axis_classes = as_int_list(cfg.get("avgdist_axis_classes", cfg.get("distance_axis_classes", desc_classes)), default=desc_classes)
+    moment2_classes = as_int_list(cfg.get("moment2_classes", desc_classes), default=desc_classes)
+    moment3_classes = as_int_list(cfg.get("moment3_classes", desc_classes), default=desc_classes)
+    moment_inv_classes = as_int_list(cfg.get("moment_inv_classes", desc_classes), default=desc_classes)
 
     shape_on = cfg.get("shape_on", "exp")  # "std" | "exp" | "both"
 
@@ -583,6 +591,9 @@ def main(cfg_path: str):
     lambda_centroid = float(cfg.get("lambda_centroid", 1.0))
     lambda_avgdist = float(cfg.get("lambda_avgdist", cfg.get("lambda_distance", 0.0)))
     lambda_avgdist_axis = float(cfg.get("lambda_avgdist_axis", cfg.get("lambda_distance_axis", 0.0)))
+    lambda_moment2 = float(cfg.get("lambda_moment2", 0.0))
+    lambda_moment3 = float(cfg.get("lambda_moment3", 0.0))
+    lambda_moment_inv = float(cfg.get("lambda_moment_inv", 0.0))
 
     centroid_norm = bool(cfg.get("centroid_norm", True))
 
@@ -592,6 +603,9 @@ def main(cfg_path: str):
     centroid_tolerance = float(cfg.get("centroid_tolerance", 0.05))
     avgdist_tolerance = float(cfg.get("avgdist_tolerance", 0.05))
     avgdist_axis_tolerance = float(cfg.get("avgdist_axis_tolerance", 0.05))
+    moment2_tolerance = float(cfg.get("moment2_tolerance", 0.02))
+    moment3_tolerance = float(cfg.get("moment3_tolerance", 0.01))
+    moment_inv_tolerance = float(cfg.get("moment_inv_tolerance", 0.01))
     barrier = LogBarrierLoss(t=barrier_t)
 
     # training mode switches
@@ -623,6 +637,9 @@ def main(cfg_path: str):
         loss_sum_avgdist_axis_z = 0.0
         loss_sum_avgdist_axis_y = 0.0
         loss_sum_avgdist_axis_x = 0.0
+        loss_sum_moment2 = 0.0
+        loss_sum_moment3 = 0.0
+        loss_sum_moment_inv = 0.0
         n_it = 0
 
         for i, batch in enumerate(train_loader):
@@ -667,6 +684,9 @@ def main(cfg_path: str):
                 avgdist_loss = logits.new_tensor(0.0)
                 avgdist_axis_loss = logits.new_tensor(0.0)
                 avgdist_axis_stats = logits.new_zeros(3)
+                moment2_loss = logits.new_tensor(0.0)
+                moment3_loss = logits.new_tensor(0.0)
+                moment_inv_loss = logits.new_tensor(0.0)
 
                 if apply_shape:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
@@ -734,12 +754,63 @@ def main(cfg_path: str):
                             else logits.new_zeros(3)
                         )
 
+                    if lambda_moment2 > 0.0 and len(moment2_classes) > 0:
+                        m2s = []
+                        for c in moment2_classes:
+                            m2s.append(
+                                compute_2nd_moment_barrier(
+                                    logits=logits,
+                                    target=lbl_rs,
+                                    n_classes=cfg["n_classes"],
+                                    moment_class=c,
+                                    barrier=barrier,
+                                    moment_tolerance=moment2_tolerance,
+                                    centroid_norm=centroid_norm,
+                                )
+                            )
+                        moment2_loss = torch.stack(m2s).mean() if m2s else logits.new_tensor(0.0)
+
+                    if lambda_moment3 > 0.0 and len(moment3_classes) > 0:
+                        m3s = []
+                        for c in moment3_classes:
+                            m3s.append(
+                                compute_3rd_moment_barrier(
+                                    logits=logits,
+                                    target=lbl_rs,
+                                    n_classes=cfg["n_classes"],
+                                    moment_class=c,
+                                    barrier=barrier,
+                                    moment_tolerance=moment3_tolerance,
+                                    centroid_norm=centroid_norm,
+                                )
+                            )
+                        moment3_loss = torch.stack(m3s).mean() if m3s else logits.new_tensor(0.0)
+
+                    if lambda_moment_inv > 0.0 and len(moment_inv_classes) > 0:
+                        mis = []
+                        for c in moment_inv_classes:
+                            mis.append(
+                                compute_moment_invariants_barrier(
+                                    logits=logits,
+                                    target=lbl_rs,
+                                    n_classes=cfg["n_classes"],
+                                    moment_class=c,
+                                    barrier=barrier,
+                                    inv_tolerance=moment_inv_tolerance,
+                                    centroid_norm=centroid_norm,
+                                )
+                            )
+                        moment_inv_loss = torch.stack(mis).mean() if mis else logits.new_tensor(0.0)
+
                 total_loss = (
                     seg_loss_bw
                     + lambda_volume * vol_loss
                     + lambda_centroid * cent_loss
                     + lambda_avgdist * avgdist_loss
                     + lambda_avgdist_axis * avgdist_axis_loss
+                    + lambda_moment2 * moment2_loss
+                    + lambda_moment3 * moment3_loss
+                    + lambda_moment_inv * moment_inv_loss
                 )
 
                 if not total_loss.requires_grad:
@@ -759,6 +830,9 @@ def main(cfg_path: str):
             avgdist_axis_z_v = float(avgdist_axis_stats[0].detach())
             avgdist_axis_y_v = float(avgdist_axis_stats[1].detach())
             avgdist_axis_x_v = float(avgdist_axis_stats[2].detach())
+            moment2_loss_v   = float(moment2_loss.detach())
+            moment3_loss_v   = float(moment3_loss.detach())
+            moment_inv_loss_v = float(moment_inv_loss.detach())
 
             loss_sum_total += total_loss_v
             loss_sum_seg_logged += seg_loss_logged_v
@@ -770,6 +844,9 @@ def main(cfg_path: str):
             loss_sum_avgdist_axis_z += avgdist_axis_z_v
             loss_sum_avgdist_axis_y += avgdist_axis_y_v
             loss_sum_avgdist_axis_x += avgdist_axis_x_v
+            loss_sum_moment2 += moment2_loss_v
+            loss_sum_moment3 += moment3_loss_v
+            loss_sum_moment_inv += moment_inv_loss_v
             n_it += 1
 
             if i % log_every == 0:
@@ -782,6 +859,9 @@ def main(cfg_path: str):
                     f"cent={cent_loss_v:.4f} "
                     f"avgdist={avgdist_loss_v:.4f} "
                     f"avgdist_axis={avgdist_axis_loss_v:.4f} "
+                    f"m2={moment2_loss_v:.4f} "
+                    f"m3={moment3_loss_v:.4f} "
+                    f"minv={moment_inv_loss_v:.4f} "
                     f"t={barrier_t:.2f} "
                     f"lr={lr_now(opt):.2e}"
                 )
@@ -797,6 +877,9 @@ def main(cfg_path: str):
             del avgdist_loss
             del avgdist_axis_loss
             del avgdist_axis_stats
+            del moment2_loss
+            del moment3_loss
+            del moment_inv_loss
             del img
             del lbl
             del batch
@@ -812,6 +895,9 @@ def main(cfg_path: str):
         loss_tr_avgdist_axis_z = loss_sum_avgdist_axis_z / max(1, n_it)
         loss_tr_avgdist_axis_y = loss_sum_avgdist_axis_y / max(1, n_it)
         loss_tr_avgdist_axis_x = loss_sum_avgdist_axis_x / max(1, n_it)
+        loss_tr_moment2 = loss_sum_moment2 / max(1, n_it)
+        loss_tr_moment3 = loss_sum_moment3 / max(1, n_it)
+        loss_tr_moment_inv = loss_sum_moment_inv / max(1, n_it)
 
         # validation (STD only)
         model.eval()
@@ -857,6 +943,9 @@ def main(cfg_path: str):
             "centroid_tolerance": centroid_tolerance,
             "avgdist_tolerance": avgdist_tolerance,
             "avgdist_axis_tolerance": avgdist_axis_tolerance,
+            "loss_tr_moment2": loss_tr_moment2,
+            "loss_tr_moment3": loss_tr_moment3,
+            "loss_tr_moment_inv": loss_tr_moment_inv,
         }
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
@@ -898,6 +987,9 @@ def main(cfg_path: str):
             f"avgdist={loss_tr_avgdist:.4f} "
             f"avgdist_axis={loss_tr_avgdist_axis:.4f} "
             f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
+            f"m2={loss_tr_moment2:.4f} "
+            f"m3={loss_tr_moment3:.4f} "
+            f"minv={loss_tr_moment_inv:.4f} | "
             f"val seg={loss_va_seg:.4f} "
             f"meanFGDice={meanFGDice:.4f} | "
             f"best={best_metric:.4f} "
