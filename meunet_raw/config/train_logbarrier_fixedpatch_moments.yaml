@@ -63,19 +63,21 @@ lambda_avgdist: 0.0             # radial mean distance to centroid barrier
 lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
-# #logbarrier toggles
+##logbarrier toggles
 # barrier_t: 5.0
 # volume_tolerance: 0.10
 # centroid_tolerance: 0.05
 # avgdist_tolerance: 0.05
 # avgdist_axis_tolerance: 0.05
-lambda_moment2: 1.0          # 6 covariance components
-lambda_moment3: 0.5          # 10 skewness components
+lambda_moment2: 0.3          # 6 covariance components
+lambda_moment3: 0.05          # 10 skewness components, target weight once fully warmed up
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
 lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
 
-moment2_tolerance: 0.02
+moment2_tolerance: 0.05
 moment3_tolerance: 0.01
 moment_inv_tolerance: 0.01
 
 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/stage1_desc_only_all_both_best_logbarrier_centx5_fixedpatch
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_warmup

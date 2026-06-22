@@ -594,6 +594,9 @@ def main(cfg_path: str):
     lambda_moment2 = float(cfg.get("lambda_moment2", 0.0))
     lambda_moment3 = float(cfg.get("lambda_moment3", 0.0))
     lambda_moment_inv = float(cfg.get("lambda_moment_inv", 0.0))
+    # linear warmup for moment3: ramp from 0 -> lambda_moment3 between these epochs
+    moment3_warmup_start = int(cfg.get("moment3_warmup_start", 0))
+    moment3_warmup_end   = int(cfg.get("moment3_warmup_end",   0))  # 0 = no warmup
 
     centroid_norm = bool(cfg.get("centroid_norm", True))
 
@@ -626,6 +629,16 @@ def main(cfg_path: str):
     t0_all = time.time()
 
     for epoch in range(1, epochs + 1):
+        # linear warmup for moment3
+        if moment3_warmup_end > moment3_warmup_start and epoch <= moment3_warmup_end:
+            if epoch <= moment3_warmup_start:
+                lambda_moment3_eff = 0.0
+            else:
+                progress = (epoch - moment3_warmup_start) / (moment3_warmup_end - moment3_warmup_start)
+                lambda_moment3_eff = progress * lambda_moment3
+        else:
+            lambda_moment3_eff = lambda_moment3
+
         model.train()
         loss_sum_total = 0.0
         loss_sum_seg_logged = 0.0
@@ -809,7 +822,7 @@ def main(cfg_path: str):
                     + lambda_avgdist * avgdist_loss
                     + lambda_avgdist_axis * avgdist_axis_loss
                     + lambda_moment2 * moment2_loss
-                    + lambda_moment3 * moment3_loss
+                    + lambda_moment3_eff * moment3_loss
                     + lambda_moment_inv * moment_inv_loss
                 )
 
