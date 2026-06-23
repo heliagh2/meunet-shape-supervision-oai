@@ -8,9 +8,14 @@ Moment hierarchy (building on existing centroid / avgdist barriers):
   rotation-invariant 2nd order              -- compute_moment_invariants_barrier
   3rd order  ->  skewness / asymmetry       -- compute_3rd_moment_barrier
 
-All moments are computed as weighted averages (normalized by total mass),
-so they are translation-invariant. With centroid_norm=True the coordinates
-lie in [0, 1], giving natural scale bounds.
+Normalization follows the standard normalized central moment definition]
+
+    eta_pqr = mu_pqr / M000^gamma,   gamma = (p+q+r)/3 + 1
+
+  2nd order (n=2): gamma = 5/3
+  3rd order (n=3): gamma = 2
+
+Centroid computation uses x_c = M_100/M_000 (unchanged).
 """
 
 import torch
@@ -39,9 +44,11 @@ def _coord_grids(B, D, H, W, device, centroid_norm):
     return torch.cat([zz, yy, xx], dim=1).contiguous()
 
 
-def _weighted_moment(w, term, w_sum):
-    """E_w[term] = sum(w * term, spatial) / sum(w, spatial).  Returns (B, 1)."""
-    return (w * term).sum(dim=(2, 3, 4)) / w_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+def _weighted_moment(w, term, w_sum, gamma=1.0):
+    """eta_pqr = sum(w * term, spatial) / M000^gamma.  Returns (B, 1)."""
+    raw = (w * term).sum(dim=(2, 3, 4))
+    m00 = w_sum.squeeze(-1).squeeze(-1).squeeze(-1)
+    return raw / (m00 ** gamma)
 
 
 def _barrier_pair(barrier, pred_m, gt_m, tol):
@@ -90,17 +97,16 @@ def compute_2nd_moment_barrier(
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    return_stats=False,
 ):
     """
     Log-barrier on the 6 normalized 2nd-order central moments:
 
-        mu_200, mu_020, mu_002   variance along z, y, x
-        mu_110, mu_101, mu_011   cross-covariances
+        eta_200, eta_020, eta_002   spread along z, y, x
+        eta_110, eta_101, eta_011   cross-covariances
 
-    These are the independent components of the 3x3 covariance matrix,
-    which approximates the shape as a Gaussian ellipsoid.
-
-    mu_{pqr} = E_w[(z-z_c)^p (y-y_c)^q (x-x_c)^r]
+    Uses gamma = 5/3  (n=2, 3-D extension of eq. 11-37/11-38).
+    These are the independent components of the scale-normalized covariance matrix.
     """
     logits_ref = logits  # keep for new_tensor
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -127,12 +133,18 @@ def compute_2nd_moment_barrier(
     ]
 
     loss = logits_ref.new_tensor(0.0)
+    errors = [] if return_stats else None
     for pt, gt in terms:
-        pred_m = _weighted_moment(pred_w, pt, pred_sum).squeeze(1)[has_class]
-        gt_m   = _weighted_moment(gt_mask, gt, gt_sum).squeeze(1)[has_class]
+        pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=5/3).squeeze(1)[has_class]
+        gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=5/3).squeeze(1)[has_class]
+        if return_stats:
+            errors.append((pred_m - gt_m).abs().mean())
         loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
         del pt, gt, pred_m, gt_m
 
+    if return_stats:
+        mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
+        return loss, mean_err
     return loss
 
 
@@ -172,12 +184,12 @@ def compute_moment_invariants_barrier(
         dz = coords[:, 0:1] - c[:, 0:1]
         dy = coords[:, 1:2] - c[:, 1:2]
         dx = coords[:, 2:3] - c[:, 2:3]
-        c200 = _weighted_moment(w, dz * dz, w_sum)
-        c020 = _weighted_moment(w, dy * dy, w_sum)
-        c002 = _weighted_moment(w, dx * dx, w_sum)
-        c110 = _weighted_moment(w, dz * dy, w_sum)
-        c101 = _weighted_moment(w, dz * dx, w_sum)
-        c011 = _weighted_moment(w, dy * dx, w_sum)
+        c200 = _weighted_moment(w, dz * dz, w_sum, gamma=5/3)
+        c020 = _weighted_moment(w, dy * dy, w_sum, gamma=5/3)
+        c002 = _weighted_moment(w, dx * dx, w_sum, gamma=5/3)
+        c110 = _weighted_moment(w, dz * dy, w_sum, gamma=5/3)
+        c101 = _weighted_moment(w, dz * dx, w_sum, gamma=5/3)
+        c011 = _weighted_moment(w, dy * dx, w_sum, gamma=5/3)
         return c200, c020, c002, c110, c101, c011
 
     def _invariants(c200, c020, c002, c110, c101, c011):
@@ -211,17 +223,18 @@ def compute_3rd_moment_barrier(
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    return_stats=False,
 ):
     """
     Log-barrier on all 10 normalized 3rd-order central moments:
 
-        mu_300, mu_030, mu_003               pure cubic (per-axis skewness)
-        mu_210, mu_201, mu_120, mu_021,
-        mu_102, mu_012                        mixed cubic
-        mu_111                               triple cross-term
+        eta_300, eta_030, eta_003               per-axis skewness
+        eta_210, eta_201, eta_120, eta_021,
+        eta_102, eta_012                        mixed cubic
+        eta_111                                triple cross-term
 
-    Captures asymmetry and handedness of the shape beyond the ellipsoid
-    approximation of the 2nd order moments.
+    Uses gamma = 2  (n=3, 3-D extension of eq. 11-37/11-38).
+    Captures asymmetry and handedness beyond the 2nd order ellipsoid.
     """
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -256,11 +269,17 @@ def compute_3rd_moment_barrier(
     ]
 
     loss = logits_ref.new_tensor(0.0)
+    errors = [] if return_stats else None
     for pt, gt in terms:
-        pred_m = _weighted_moment(pred_w, pt, pred_sum).squeeze(1)[has_class]
-        gt_m   = _weighted_moment(gt_mask, gt, gt_sum).squeeze(1)[has_class]
+        pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=2.0).squeeze(1)[has_class]
+        gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=2.0).squeeze(1)[has_class]
+        if return_stats:
+            errors.append((pred_m - gt_m).abs().mean())
         loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
         del pt, gt, pred_m, gt_m
 
     del dz_p2, dy_p2, dx_p2, dz_g2, dy_g2, dx_g2
+    if return_stats:
+        mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
+        return loss, mean_err
     return loss

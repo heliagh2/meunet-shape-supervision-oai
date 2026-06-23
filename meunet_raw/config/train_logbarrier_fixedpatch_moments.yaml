@@ -69,8 +69,8 @@ centroid_norm: true             # normalize coords to [0,1]
 # centroid_tolerance: 0.05
 # avgdist_tolerance: 0.05
 # avgdist_axis_tolerance: 0.05
-lambda_moment2: 0.3          # 6 covariance components
-lambda_moment3: 0.05          # 10 skewness components, target weight once fully warmed up
+lambda_moment2: 1          # 6 covariance components
+lambda_moment3: 1          # 10 skewness components, target weight once fully warmed up
 moment3_warmup_start: 100     # starts warming up at epoch 100
 moment3_warmup_end: 200       # fully at 0.05 by epoch 200
 lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
@@ -80,4 +80,4 @@ moment3_tolerance: 0.01
 moment_inv_tolerance: 0.01
 
 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_warmup
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_normalized
