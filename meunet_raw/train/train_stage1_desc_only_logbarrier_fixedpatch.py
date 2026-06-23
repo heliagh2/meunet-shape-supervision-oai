@@ -789,7 +789,7 @@ def main(cfg_path: str):
                         moment2_loss = torch.stack(m2s).mean() if m2s else logits.new_tensor(0.0)
                         moment2_err  = torch.stack(m2_errs).mean() if m2_errs else logits.new_tensor(0.0)
 
-                    if lambda_moment3_eff > 0.0 and len(moment3_classes) > 0:
+                    if len(moment3_classes) > 0:
                         m3s, m3_errs = [], []
                         for c in moment3_classes:
                             l_c, e_c = compute_3rd_moment_barrier(
