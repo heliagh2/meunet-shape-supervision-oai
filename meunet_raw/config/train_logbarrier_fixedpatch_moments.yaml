@@ -80,4 +80,4 @@ moment3_tolerance: 5.0e-9  # updated according to values
 moment_inv_tolerance: 0.01
 
 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_normalized
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_normalized2
