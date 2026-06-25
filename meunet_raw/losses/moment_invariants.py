@@ -8,14 +8,16 @@ Moment hierarchy (building on existing centroid / avgdist barriers):
   rotation-invariant 2nd order              -- compute_moment_invariants_barrier
   3rd order  ->  skewness / asymmetry       -- compute_3rd_moment_barrier
 
-Normalization follows the standard normalized central moment definition]
+Normalization uses fractional mass f = M000/(D*H*W) instead of absolute
+count M000, giving the same scale-invariance as the textbook formula while
+keeping values in O(1e-2) for 3-D medical volumes:
 
-    eta_pqr = mu_pqr / M000^gamma,   gamma = (p+q+r)/3 + 1
+    eta_pqr = mu_pqr / (f^gamma * vol),   gamma = (p+q+r)/3 + 1
 
-  2nd order (n=2): gamma = 5/3
-  3rd order (n=3): gamma = 2
+  2nd order (n=2): gamma = 5/3,  values O(1e-2)
+  3rd order (n=3): gamma = 2,    values O(1e-2)
 
-Centroid computation uses x_c = M_100/M_000 (unchanged).
+Centroid computation uses x_c = M_100/M_000 (unchanged, eq. 11-36).
 """
 
 import torch
@@ -45,10 +47,24 @@ def _coord_grids(B, D, H, W, device, centroid_norm):
 
 
 def _weighted_moment(w, term, w_sum, gamma=1.0):
-    """eta_pqr = sum(w * term, spatial) / M000^gamma.  Returns (B, 1)."""
+    """eta_pqr = mu_pqr / (f^gamma * vol),  f = M000/vol (class fraction).
+
+    Equivalent to the textbook M000^gamma normalization but using fractional
+    mass f = M000/(D*H*W) instead of absolute count M000.  For fixed patch
+    size vol is a constant, so the two differ only by vol^(gamma-1) — a
+    constant scale factor that keeps values tractable for 3-D volumes where
+    M000^gamma would otherwise be O(1e6–1e8).
+
+    For gamma=1 this reduces to the plain weighted average mu/M000.
+    Returns (B, 1).
+    """
     raw = (w * term).sum(dim=(2, 3, 4))
-    m00 = w_sum.squeeze(-1).squeeze(-1).squeeze(-1)
-    return raw / (m00 ** gamma)
+    m00 = w_sum.squeeze(-1).squeeze(-1).squeeze(-1)  # (B, 1)
+    if gamma == 1.0:
+        return raw / m00
+    vol = float(w.shape[2] * w.shape[3] * w.shape[4])
+    f = m00 / vol  # class fraction in (0, 1]
+    return raw / (f ** gamma * vol)
 
 
 def _barrier_pair(barrier, pred_m, gt_m, tol):
@@ -98,17 +114,27 @@ def compute_2nd_moment_barrier(
     ignore_index=-1,
     eps=1e-6,
     return_stats=False,
+    sqrt_diagonal=True,
 ):
     """
-    Log-barrier on the 6 normalized 2nd-order central moments:
+    Log-barrier on the 6 normalized 2nd-order central moments.
 
-        eta_200, eta_020, eta_002   spread along z, y, x
-        eta_110, eta_101, eta_011   cross-covariances
+    Diagonal (variance per axis):
+        eta_200, eta_020, eta_002
 
-    Uses gamma = 5/3  (n=2, 3-D extension of eq. 11-37/11-38).
-    These are the independent components of the scale-normalized covariance matrix.
+    Off-diagonal (cross-covariances, can be negative):
+        eta_110, eta_101, eta_011
+
+    With sqrt_diagonal=True (default), the three diagonal terms are square-rooted
+    after normalization, giving per-axis standard deviations equivalent to
+    avgdist_axis.  This amplifies the gradient signal for thin structures
+    (d(sqrt(eta))/d(eta) = 1/(2*sqrt(eta)) grows as eta → 0), which is
+    exactly what makes avgdist_axis effective for small curved classes.
+    Off-diagonal terms stay raw (no sqrt, since covariances can be negative).
+
+    All terms use fractional mass normalization (gamma = 5/3).
     """
-    logits_ref = logits  # keep for new_tensor
+    logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
         logits, target, n_classes, moment_class, ignore_index, eps, centroid_norm
     )
@@ -123,20 +149,24 @@ def compute_2nd_moment_barrier(
     dy_g = coords[:, 1:2] - gt_c[:, 1:2]
     dx_g = coords[:, 2:3] - gt_c[:, 2:3]
 
+    # (is_diagonal, pred_term, gt_term)
     terms = [
-        (dz_p ** 2,   dz_g ** 2),    # mu_200
-        (dy_p ** 2,   dy_g ** 2),    # mu_020
-        (dx_p ** 2,   dx_g ** 2),    # mu_002
-        (dz_p * dy_p, dz_g * dy_g),  # mu_110
-        (dz_p * dx_p, dz_g * dx_g),  # mu_101
-        (dy_p * dx_p, dy_g * dx_g),  # mu_011
+        (True,  dz_p ** 2,   dz_g ** 2),    # mu_200  -> sqrt gives sigma_z
+        (True,  dy_p ** 2,   dy_g ** 2),    # mu_020  -> sqrt gives sigma_y
+        (True,  dx_p ** 2,   dx_g ** 2),    # mu_002  -> sqrt gives sigma_x
+        (False, dz_p * dy_p, dz_g * dy_g),  # mu_110
+        (False, dz_p * dx_p, dz_g * dx_g),  # mu_101
+        (False, dy_p * dx_p, dy_g * dx_g),  # mu_011
     ]
 
     loss = logits_ref.new_tensor(0.0)
     errors = [] if return_stats else None
-    for pt, gt in terms:
+    for is_diag, pt, gt in terms:
         pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=5/3).squeeze(1)[has_class]
         gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=5/3).squeeze(1)[has_class]
+        if sqrt_diagonal and is_diag:
+            pred_m = torch.sqrt(pred_m.clamp(min=0) + eps)
+            gt_m   = torch.sqrt(gt_m.clamp(min=0)   + eps)
         if return_stats:
             errors.append((pred_m - gt_m).abs().mean())
         loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
@@ -233,7 +263,10 @@ def compute_3rd_moment_barrier(
         eta_102, eta_012                        mixed cubic
         eta_111                                triple cross-term
 
-    Uses gamma = 2  (n=3, 3-D extension of eq. 11-37/11-38).
+    Uses gamma = 2 via fractional mass normalization: eta = mu / (f^2 * vol),
+    f = M000/vol.  Gives the same scale-invariance as the textbook M000^2
+    formula but keeps values in O(1e-2) for 3-D medical volumes instead of
+    the O(1e-8) that makes textbook normalization numerically unusable here.
     Captures asymmetry and handedness beyond the 2nd order ellipsoid.
     """
     logits_ref = logits

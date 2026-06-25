@@ -609,6 +609,7 @@ def main(cfg_path: str):
     moment2_tolerance = float(cfg.get("moment2_tolerance", 0.02))
     moment3_tolerance = float(cfg.get("moment3_tolerance", 0.01))
     moment_inv_tolerance = float(cfg.get("moment_inv_tolerance", 0.01))
+    moment2_sqrt_diagonal = bool(cfg.get("moment2_sqrt_diagonal", True))
     barrier = LogBarrierLoss(t=barrier_t)
 
     # training mode switches
@@ -783,6 +784,7 @@ def main(cfg_path: str):
                                 moment_tolerance=moment2_tolerance,
                                 centroid_norm=centroid_norm,
                                 return_stats=True,
+                                sqrt_diagonal=moment2_sqrt_diagonal,
                             )
                             m2s.append(l_c)
                             m2_errs.append(e_c)

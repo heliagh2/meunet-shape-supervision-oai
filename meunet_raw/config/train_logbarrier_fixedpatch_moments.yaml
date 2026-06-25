@@ -75,9 +75,10 @@ moment3_warmup_start: 100     # starts warming up at epoch 100
 moment3_warmup_end: 200       # fully at 0.05 by epoch 200
 lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
 
-moment2_tolerance: 1.0e-5
-moment3_tolerance: 5.0e-9  # updated according to values
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 1.0e-2
+moment3_tolerance: 1.0e-2  # updated according to values
 moment_inv_tolerance: 0.01
 
 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_normalized2
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_frac
