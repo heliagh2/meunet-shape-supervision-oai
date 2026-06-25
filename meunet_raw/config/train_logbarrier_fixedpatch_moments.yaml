@@ -80,5 +80,7 @@ moment2_tolerance: 1.0e-2
 moment3_tolerance: 5.0e-3  # updated according to values
 moment_inv_tolerance: 0.01
 
-
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: moments_fractional_sqrt_diag 
 workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_frac

@@ -22,6 +22,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 from data.dataset_oai_raw_fixedpatch import OAIPairedPatch, load_splits
 from models.meunet3d import MEUNet3D
 from losses.dice_ce import DiceCELoss
@@ -533,6 +539,20 @@ def main(cfg_path: str):
 
     print("=== Running LOG-BARRIER with FIXED 1 STD + 1 EXP patch experiment ===")
 
+    # wandb
+    use_wandb = bool(cfg.get("use_wandb", False))
+    if use_wandb and not WANDB_AVAILABLE:
+        print("Warning: use_wandb=True but wandb is not installed — disabling.")
+        use_wandb = False
+    if use_wandb:
+        wandb.init(
+            project=cfg.get("wandb_project", "meunet-shape-supervision"),
+            entity=cfg.get("wandb_entity", None),
+            name=cfg.get("wandb_run_name", Path(cfg["workdir"]).name),
+            config=cfg,
+            dir=str(workdir),
+        )
+
     seed_all(int(cfg.get("seed", 777)))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -986,6 +1006,44 @@ def main(cfg_path: str):
         rows.append(row)
         pd.DataFrame(rows).to_csv(csv_path, index=False)
 
+        if use_wandb:
+            wandb.log({
+                # total and seg monitoring
+                "train/total":          loss_tr_total,
+                "train/seg_logged":     loss_tr_seg_logged,
+                "train/seg_bw":         loss_tr_seg_bw,
+                # raw barrier values (unweighted) — what the barrier actually outputs
+                "desc/vol_barrier":         loss_tr_vol,
+                "desc/cent_barrier":        loss_tr_cent,
+                "desc/avgdist_barrier":     loss_tr_avgdist,
+                "desc/avgdist_axis_barrier":loss_tr_avgdist_axis,
+                "desc/avgdist_axis_z":      loss_tr_avgdist_axis_z,
+                "desc/avgdist_axis_y":      loss_tr_avgdist_axis_y,
+                "desc/avgdist_axis_x":      loss_tr_avgdist_axis_x,
+                "desc/m2_barrier":          loss_tr_moment2,
+                "desc/m2_err":              loss_tr_moment2_err,
+                "desc/m3_barrier":          loss_tr_moment3,
+                "desc/m3_err":              loss_tr_moment3_err,
+                "desc/minv_barrier":        loss_tr_moment_inv,
+                # weighted contributions (lambda × barrier) — what drives the gradient
+                "contrib/vol":          lambda_volume    * loss_tr_vol,
+                "contrib/cent":         lambda_centroid  * loss_tr_cent,
+                "contrib/avgdist":      lambda_avgdist   * loss_tr_avgdist,
+                "contrib/avgdist_axis": lambda_avgdist_axis * loss_tr_avgdist_axis,
+                "contrib/m2":           lambda_moment2   * loss_tr_moment2,
+                "contrib/m3":           lambda_moment3_eff * loss_tr_moment3,
+                "contrib/minv":         lambda_moment_inv  * loss_tr_moment_inv,
+                # validation
+                "val/seg":              loss_va_seg,
+                "val/meanFGDice":       meanFGDice,
+                **{f"val/dice_c{k}": float(d)
+                   for k, d in enumerate(dices.tolist(), start=1)},
+                # schedule
+                "schedule/lr":              lr_now(opt),
+                "schedule/lambda_m3_eff":   lambda_moment3_eff,
+                "schedule/barrier_t":       barrier_t,
+            }, step=epoch)
+
         # periodic checkpoints
         if ckpt_every > 0 and (epoch % ckpt_every == 0):
             torch.save(model.state_dict(), workdir / f"checkpoint_ep{epoch:03d}.pt")
@@ -1036,6 +1094,9 @@ def main(cfg_path: str):
     torch.save(model.state_dict(), workdir / "checkpoint_final.pt")
     dt = time.time() - t0_all
     print(f"Done. Total time: {dt/3600:.2f}h. Workdir: {workdir}")
+
+    if use_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":
