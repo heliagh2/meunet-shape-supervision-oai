@@ -8,14 +8,24 @@ Moment hierarchy (building on existing centroid / avgdist barriers):
   rotation-invariant 2nd order              -- compute_moment_invariants_barrier
   3rd order  ->  skewness / asymmetry       -- compute_3rd_moment_barrier
 
-Normalization uses fractional mass f = M000/(D*H*W) instead of absolute
-count M000, giving the same scale-invariance as the textbook formula while
-keeping values in O(1e-2) for 3-D medical volumes:
+Normalization is controlled by the `gamma` parameter in each function:
 
-    eta_pqr = mu_pqr / (f^gamma * vol),   gamma = (p+q+r)/3 + 1
+  gamma = 1.0  (default): weighted average  eta = mu / M000
+      -- per-class size invariant, values O(1e-3), tractable gradients
 
-  2nd order (n=2): gamma = 5/3,  values O(1e-2)
-  3rd order (n=3): gamma = 2,    values O(1e-2)
+  gamma = 5/3 or 2.0 (fractional mass): eta = mu / (f^gamma * vol), f = M000/vol
+      -- additionally scale-invariant across resolutions, values O(1e-2)
+      -- can cause "spreading" failure mode for large classes (see training notes)
+
+Configure via `moment_normalization: "gamma1"` (default) or `"fractional"` in the
+YAML config. The training script translates this to the correct gamma values.
+
+sqrt_diagonal option (default True):
+  For 2nd order diagonal (mu_200/020/002): regular sqrt → per-axis std dev,
+    same gradient amplification as avgdist_axis (helpful for thin structures).
+  For 3rd order pure cubic (mu_300/030/003): signed sqrt → preserves skewness
+    direction while amplifying gradient when skewness is small.
+  Off-diagonal / mixed terms are always kept raw (can be negative).
 
 Centroid computation uses x_c = M_100/M_000 (unchanged, eq. 11-36).
 """
@@ -47,15 +57,11 @@ def _coord_grids(B, D, H, W, device, centroid_norm):
 
 
 def _weighted_moment(w, term, w_sum, gamma=1.0):
-    """eta_pqr = mu_pqr / (f^gamma * vol),  f = M000/vol (class fraction).
+    """Normalized central moment.
 
-    Equivalent to the textbook M000^gamma normalization but using fractional
-    mass f = M000/(D*H*W) instead of absolute count M000.  For fixed patch
-    size vol is a constant, so the two differ only by vol^(gamma-1) — a
-    constant scale factor that keeps values tractable for 3-D volumes where
-    M000^gamma would otherwise be O(1e6–1e8).
+    gamma=1 (default): eta = mu / M000  (weighted average, per-class invariant)
+    gamma>1:           eta = mu / (f^gamma * vol), f = M000/vol  (fractional mass)
 
-    For gamma=1 this reduces to the plain weighted average mu/M000.
     Returns (B, 1).
     """
     raw = (w * term).sum(dim=(2, 3, 4))
@@ -114,25 +120,22 @@ def compute_2nd_moment_barrier(
     ignore_index=-1,
     eps=1e-6,
     return_stats=False,
+    gamma=1.0,
     sqrt_diagonal=True,
 ):
     """
     Log-barrier on the 6 normalized 2nd-order central moments.
 
-    Diagonal (variance per axis):
-        eta_200, eta_020, eta_002
+    Diagonal (variance per axis) — mu_200, mu_020, mu_002:
+      With sqrt_diagonal=True (default): square-rooted after normalization,
+      giving per-axis standard deviations.  This amplifies gradient signal for
+      thin structures (d(sqrt(eta))/d(eta) = 1/(2*sqrt(eta)) → large when small),
+      matching the behaviour of avgdist_axis.
 
-    Off-diagonal (cross-covariances, can be negative):
-        eta_110, eta_101, eta_011
+    Off-diagonal (cross-covariances, can be negative) — mu_110, mu_101, mu_011:
+      Always kept raw; no sqrt since covariances can be negative.
 
-    With sqrt_diagonal=True (default), the three diagonal terms are square-rooted
-    after normalization, giving per-axis standard deviations equivalent to
-    avgdist_axis.  This amplifies the gradient signal for thin structures
-    (d(sqrt(eta))/d(eta) = 1/(2*sqrt(eta)) grows as eta → 0), which is
-    exactly what makes avgdist_axis effective for small curved classes.
-    Off-diagonal terms stay raw (no sqrt, since covariances can be negative).
-
-    All terms use fractional mass normalization (gamma = 5/3).
+    gamma: normalization order (1.0 = weighted average, 5/3 = fractional mass).
     """
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -140,6 +143,8 @@ def compute_2nd_moment_barrier(
     )
 
     if not has_class.any():
+        if return_stats:
+            return logits_ref.new_tensor(0.0), logits_ref.new_tensor(0.0)
         return logits_ref.new_tensor(0.0)
 
     dz_p = coords[:, 0:1] - pred_c[:, 0:1]
@@ -162,8 +167,8 @@ def compute_2nd_moment_barrier(
     loss = logits_ref.new_tensor(0.0)
     errors = [] if return_stats else None
     for is_diag, pt, gt in terms:
-        pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=5/3).squeeze(1)[has_class]
-        gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=5/3).squeeze(1)[has_class]
+        pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=gamma).squeeze(1)[has_class]
+        gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=gamma).squeeze(1)[has_class]
         if sqrt_diagonal and is_diag:
             pred_m = torch.sqrt(pred_m.clamp(min=0) + eps)
             gt_m   = torch.sqrt(gt_m.clamp(min=0)   + eps)
@@ -190,6 +195,7 @@ def compute_moment_invariants_barrier(
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    gamma=1.0,
 ):
     """
     Log-barrier on the three rotation-invariant scalars derived from the
@@ -199,8 +205,8 @@ def compute_moment_invariants_barrier(
         J2 = sum of 2x2 principal minors      -- pairwise spread product
         J3 = det(Sigma)                        -- volume of the ellipsoid
 
-    Invariant to translation, rigid rotation, and (approximately) scale
-    when centroid_norm=True.
+    Invariant to translation, rigid rotation, and (approximately) scale.
+    gamma: normalization order (1.0 = weighted average, 5/3 = fractional mass).
     """
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -214,12 +220,12 @@ def compute_moment_invariants_barrier(
         dz = coords[:, 0:1] - c[:, 0:1]
         dy = coords[:, 1:2] - c[:, 1:2]
         dx = coords[:, 2:3] - c[:, 2:3]
-        c200 = _weighted_moment(w, dz * dz, w_sum, gamma=5/3)
-        c020 = _weighted_moment(w, dy * dy, w_sum, gamma=5/3)
-        c002 = _weighted_moment(w, dx * dx, w_sum, gamma=5/3)
-        c110 = _weighted_moment(w, dz * dy, w_sum, gamma=5/3)
-        c101 = _weighted_moment(w, dz * dx, w_sum, gamma=5/3)
-        c011 = _weighted_moment(w, dy * dx, w_sum, gamma=5/3)
+        c200 = _weighted_moment(w, dz * dz, w_sum, gamma=gamma)
+        c020 = _weighted_moment(w, dy * dy, w_sum, gamma=gamma)
+        c002 = _weighted_moment(w, dx * dx, w_sum, gamma=gamma)
+        c110 = _weighted_moment(w, dz * dy, w_sum, gamma=gamma)
+        c101 = _weighted_moment(w, dz * dx, w_sum, gamma=gamma)
+        c011 = _weighted_moment(w, dy * dx, w_sum, gamma=gamma)
         return c200, c020, c002, c110, c101, c011
 
     def _invariants(c200, c020, c002, c110, c101, c011):
@@ -254,20 +260,21 @@ def compute_3rd_moment_barrier(
     ignore_index=-1,
     eps=1e-6,
     return_stats=False,
+    gamma=1.0,
+    sqrt_diagonal=True,
 ):
     """
-    Log-barrier on all 10 normalized 3rd-order central moments:
+    Log-barrier on all 10 normalized 3rd-order central moments.
 
-        eta_300, eta_030, eta_003               per-axis skewness
-        eta_210, eta_201, eta_120, eta_021,
-        eta_102, eta_012                        mixed cubic
-        eta_111                                triple cross-term
+    Pure cubic (per-axis skewness) — mu_300, mu_030, mu_003:
+      With sqrt_diagonal=True (default): signed sqrt applied after normalization.
+      sign(m) * sqrt(|m|) preserves the skewness direction while amplifying
+      gradient signal when skewness magnitude is small (thin/symmetric structures).
 
-    Uses gamma = 2 via fractional mass normalization: eta = mu / (f^2 * vol),
-    f = M000/vol.  Gives the same scale-invariance as the textbook M000^2
-    formula but keeps values in O(1e-2) for 3-D medical volumes instead of
-    the O(1e-8) that makes textbook normalization numerically unusable here.
-    Captures asymmetry and handedness beyond the 2nd order ellipsoid.
+    Mixed and cross terms — mu_210, mu_201, mu_120, mu_021, mu_102, mu_012, mu_111:
+      Always kept raw (can be positive or negative).
+
+    gamma: normalization order (1.0 = weighted average, 2.0 = fractional mass).
     """
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -275,6 +282,8 @@ def compute_3rd_moment_barrier(
     )
 
     if not has_class.any():
+        if return_stats:
+            return logits_ref.new_tensor(0.0), logits_ref.new_tensor(0.0)
         return logits_ref.new_tensor(0.0)
 
     dz_p = coords[:, 0:1] - pred_c[:, 0:1]
@@ -284,28 +293,32 @@ def compute_3rd_moment_barrier(
     dy_g = coords[:, 1:2] - gt_c[:, 1:2]
     dx_g = coords[:, 2:3] - gt_c[:, 2:3]
 
-    # Reuse squared terms to halve the number of elementwise muls
     dz_p2 = dz_p ** 2;  dy_p2 = dy_p ** 2;  dx_p2 = dx_p ** 2
     dz_g2 = dz_g ** 2;  dy_g2 = dy_g ** 2;  dx_g2 = dx_g ** 2
 
+    # (is_pure_cubic, pred_term, gt_term)
     terms = [
-        (dz_p2 * dz_p,        dz_g2 * dz_g),        # mu_300
-        (dy_p2 * dy_p,        dy_g2 * dy_g),        # mu_030
-        (dx_p2 * dx_p,        dx_g2 * dx_g),        # mu_003
-        (dz_p2 * dy_p,        dz_g2 * dy_g),        # mu_210
-        (dz_p2 * dx_p,        dz_g2 * dx_g),        # mu_201
-        (dz_p  * dy_p2,       dz_g  * dy_g2),       # mu_120
-        (dy_p2 * dx_p,        dy_g2 * dx_g),        # mu_021
-        (dz_p  * dx_p2,       dz_g  * dx_g2),       # mu_102
-        (dy_p  * dx_p2,       dy_g  * dx_g2),       # mu_012
-        (dz_p  * dy_p * dx_p, dz_g  * dy_g * dx_g), # mu_111
+        (True,  dz_p2 * dz_p,        dz_g2 * dz_g),        # mu_300  -> signed sqrt
+        (True,  dy_p2 * dy_p,        dy_g2 * dy_g),        # mu_030
+        (True,  dx_p2 * dx_p,        dx_g2 * dx_g),        # mu_003
+        (False, dz_p2 * dy_p,        dz_g2 * dy_g),        # mu_210
+        (False, dz_p2 * dx_p,        dz_g2 * dx_g),        # mu_201
+        (False, dz_p  * dy_p2,       dz_g  * dy_g2),       # mu_120
+        (False, dy_p2 * dx_p,        dy_g2 * dx_g),        # mu_021
+        (False, dz_p  * dx_p2,       dz_g  * dx_g2),       # mu_102
+        (False, dy_p  * dx_p2,       dy_g  * dx_g2),       # mu_012
+        (False, dz_p  * dy_p * dx_p, dz_g  * dy_g * dx_g), # mu_111
     ]
 
     loss = logits_ref.new_tensor(0.0)
     errors = [] if return_stats else None
-    for pt, gt in terms:
-        pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=2.0).squeeze(1)[has_class]
-        gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=2.0).squeeze(1)[has_class]
+    for is_pure_cubic, pt, gt in terms:
+        pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=gamma).squeeze(1)[has_class]
+        gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=gamma).squeeze(1)[has_class]
+        if sqrt_diagonal and is_pure_cubic:
+            # signed sqrt: preserves skewness direction, amplifies gradient for small |m|
+            pred_m = torch.sign(pred_m) * torch.sqrt(pred_m.abs() + eps)
+            gt_m   = torch.sign(gt_m)   * torch.sqrt(gt_m.abs()   + eps)
         if return_stats:
             errors.append((pred_m - gt_m).abs().mean())
         loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)

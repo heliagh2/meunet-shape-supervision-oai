@@ -630,6 +630,13 @@ def main(cfg_path: str):
     moment3_tolerance = float(cfg.get("moment3_tolerance", 0.01))
     moment_inv_tolerance = float(cfg.get("moment_inv_tolerance", 0.01))
     moment2_sqrt_diagonal = bool(cfg.get("moment2_sqrt_diagonal", True))
+    moment3_sqrt_diagonal = bool(cfg.get("moment3_sqrt_diagonal", True))
+    # "gamma1" (default): weighted average, tractable gradients, no spreading artefacts
+    # "fractional": fractional mass normalization, scale-invariant across resolutions
+    _moment_norm = cfg.get("moment_normalization", "gamma1")
+    moment2_gamma = 5/3 if _moment_norm == "fractional" else 1.0
+    moment3_gamma = 2.0  if _moment_norm == "fractional" else 1.0
+    moment_inv_gamma = 5/3 if _moment_norm == "fractional" else 1.0
     barrier = LogBarrierLoss(t=barrier_t)
 
     # training mode switches
@@ -676,6 +683,8 @@ def main(cfg_path: str):
         loss_sum_moment_inv = 0.0
         loss_sum_moment2_err = 0.0
         loss_sum_moment3_err = 0.0
+        loss_sum_moment2_err_per_class = {c: 0.0 for c in moment2_classes}
+        loss_sum_moment3_err_per_class = {c: 0.0 for c in moment3_classes}
         n_it = 0
 
         for i, batch in enumerate(train_loader):
@@ -793,7 +802,7 @@ def main(cfg_path: str):
                         )
 
                     if lambda_moment2 > 0.0 and len(moment2_classes) > 0:
-                        m2s, m2_errs = [], []
+                        m2s, m2_errs_per_class = [], {}
                         for c in moment2_classes:
                             l_c, e_c = compute_2nd_moment_barrier(
                                 logits=logits,
@@ -804,15 +813,16 @@ def main(cfg_path: str):
                                 moment_tolerance=moment2_tolerance,
                                 centroid_norm=centroid_norm,
                                 return_stats=True,
+                                gamma=moment2_gamma,
                                 sqrt_diagonal=moment2_sqrt_diagonal,
                             )
                             m2s.append(l_c)
-                            m2_errs.append(e_c)
+                            m2_errs_per_class[c] = e_c
                         moment2_loss = torch.stack(m2s).mean() if m2s else logits.new_tensor(0.0)
-                        moment2_err  = torch.stack(m2_errs).mean() if m2_errs else logits.new_tensor(0.0)
+                        moment2_err  = torch.stack(list(m2_errs_per_class.values())).mean() if m2_errs_per_class else logits.new_tensor(0.0)
 
                     if len(moment3_classes) > 0:
-                        m3s, m3_errs = [], []
+                        m3s, m3_errs_per_class = [], {}
                         for c in moment3_classes:
                             l_c, e_c = compute_3rd_moment_barrier(
                                 logits=logits,
@@ -823,11 +833,13 @@ def main(cfg_path: str):
                                 moment_tolerance=moment3_tolerance,
                                 centroid_norm=centroid_norm,
                                 return_stats=True,
+                                gamma=moment3_gamma,
+                                sqrt_diagonal=moment3_sqrt_diagonal,
                             )
                             m3s.append(l_c)
-                            m3_errs.append(e_c)
+                            m3_errs_per_class[c] = e_c
                         moment3_loss = torch.stack(m3s).mean() if m3s else logits.new_tensor(0.0)
-                        moment3_err  = torch.stack(m3_errs).mean() if m3_errs else logits.new_tensor(0.0)
+                        moment3_err  = torch.stack(list(m3_errs_per_class.values())).mean() if m3_errs_per_class else logits.new_tensor(0.0)
 
                     if lambda_moment_inv > 0.0 and len(moment_inv_classes) > 0:
                         mis = []
@@ -841,6 +853,7 @@ def main(cfg_path: str):
                                     barrier=barrier,
                                     inv_tolerance=moment_inv_tolerance,
                                     centroid_norm=centroid_norm,
+                                    gamma=moment_inv_gamma,
                                 )
                             )
                         moment_inv_loss = torch.stack(mis).mean() if mis else logits.new_tensor(0.0)
@@ -894,6 +907,10 @@ def main(cfg_path: str):
             loss_sum_moment_inv += moment_inv_loss_v
             loss_sum_moment2_err += moment2_err_v
             loss_sum_moment3_err += moment3_err_v
+            for c, e in m2_errs_per_class.items():
+                loss_sum_moment2_err_per_class[c] += float(e.detach())
+            for c, e in m3_errs_per_class.items():
+                loss_sum_moment3_err_per_class[c] += float(e.detach())
             n_it += 1
 
             if i % log_every == 0:
@@ -929,6 +946,8 @@ def main(cfg_path: str):
             del moment_inv_loss
             del moment2_err
             del moment3_err
+            del m2_errs_per_class
+            del m3_errs_per_class
             del img
             del lbl
             del batch
@@ -949,6 +968,8 @@ def main(cfg_path: str):
         loss_tr_moment_inv = loss_sum_moment_inv / max(1, n_it)
         loss_tr_moment2_err = loss_sum_moment2_err / max(1, n_it)
         loss_tr_moment3_err = loss_sum_moment3_err / max(1, n_it)
+        loss_tr_moment2_err_per_class = {c: loss_sum_moment2_err_per_class[c] / max(1, n_it) for c in moment2_classes}
+        loss_tr_moment3_err_per_class = {c: loss_sum_moment3_err_per_class[c] / max(1, n_it) for c in moment3_classes}
 
         # validation (STD only)
         model.eval()
@@ -1025,6 +1046,9 @@ def main(cfg_path: str):
                 "desc/m3_barrier":          loss_tr_moment3,
                 "desc/m3_err":              loss_tr_moment3_err,
                 "desc/minv_barrier":        loss_tr_moment_inv,
+                # per-anatomy moment errors
+                **{f"desc/m2_err_c{c}": loss_tr_moment2_err_per_class[c] for c in moment2_classes},
+                **{f"desc/m3_err_c{c}": loss_tr_moment3_err_per_class[c] for c in moment3_classes},
                 # weighted contributions (lambda × barrier) — what drives the gradient
                 "contrib/vol":          lambda_volume    * loss_tr_vol,
                 "contrib/cent":         lambda_centroid  * loss_tr_cent,
