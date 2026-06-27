@@ -8,14 +8,17 @@ REPO_ROOT = THIS_DIR.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import json
+import os
 import time
 import random
 import argparse
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 
 import pandas as pd
 import matplotlib
@@ -116,7 +119,7 @@ def soft_dice_per_class(logits, target, n_classes, ignore_index=-1, eps=1e-6):
     return dice.mean(dim=0).cpu().double().tolist()
 
 
-def make_loader(cfg, stems, train: bool):
+def make_loader(cfg, stems, train: bool, sampler=None):
     """
     DataLoader for the FIXED 1-STD + 1-EXP patch per case experiment.
 
@@ -141,10 +144,11 @@ def make_loader(cfg, stems, train: bool):
     loader = DataLoader(
         ds,
         batch_size=int(cfg["batch_size"]),
-        shuffle=train,
+        shuffle=(train and sampler is None),
+        sampler=sampler,
         num_workers=int(cfg["num_workers"]),
         pin_memory=False,
-        drop_last=False,
+        drop_last=train,
     )
 
     return loader
@@ -528,23 +532,44 @@ def plot_progress(workdir: Path):
 #main
 
 def main(cfg_path: str):
+    # DDP init — falls back gracefully to single-GPU when launched without torchrun
+    use_ddp = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if use_ddp:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+    else:
+        rank = 0
+        local_rank = 0
+        world_size = 1
+    is_main = (rank == 0)
+
     with open(cfg_path, "r") as f:
         cfg = json.load(f) if cfg_path.endswith(".json") else __import__("yaml").safe_load(f)
 
     workdir = Path(cfg["workdir"])
-    workdir.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        workdir.mkdir(parents=True, exist_ok=True)
 
-    with open(workdir / "config_snapshot.yaml", "w") as f:
-        __import__("yaml").safe_dump(cfg, f)
+    if use_ddp:
+        dist.barrier()
 
-    print("=== Running LOG-BARRIER with FIXED 1 STD + 1 EXP patch experiment ===")
+    if is_main:
+        with open(workdir / "config_snapshot.yaml", "w") as f:
+            __import__("yaml").safe_dump(cfg, f)
 
-    # wandb
+    if is_main:
+        print("=== Running LOG-BARRIER with FIXED 1 STD + 1 EXP patch experiment ===")
+
+    # wandb (rank 0 only)
     use_wandb = bool(cfg.get("use_wandb", False))
     if use_wandb and not WANDB_AVAILABLE:
-        print("Warning: use_wandb=True but wandb is not installed — disabling.")
+        if is_main:
+            print("Warning: use_wandb=True but wandb is not installed — disabling.")
         use_wandb = False
-    if use_wandb:
+    if use_wandb and is_main:
         wandb.init(
             project=cfg.get("wandb_project", "meunet-shape-supervision"),
             entity=cfg.get("wandb_entity", None),
@@ -553,10 +578,12 @@ def main(cfg_path: str):
             dir=str(workdir),
         )
 
-    seed_all(int(cfg.get("seed", 777)))
+    # Each rank gets a different seed offset so augmentation is not identical
+    seed_all(int(cfg.get("seed", 777)) + rank)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device)
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if is_main:
+        print("Device:", device, f"| world_size={world_size}")
 
     # splits
     splits = load_splits(cfg)
@@ -570,10 +597,28 @@ def main(cfg_path: str):
         tr_stems, va_stems = split[0], split[1]
     else:
         raise ValueError(f"Unexpected split format: {type(split)} with value {str(split)[:200]}")
-    print(f"Fold {fold}: train={len(tr_stems)} val={len(va_stems)}")
+    if is_main:
+        print(f"Fold {fold}: train={len(tr_stems)} val={len(va_stems)}")
 
-    train_loader = make_loader(cfg, tr_stems, train=True)
-    val_loader   = make_loader(cfg, va_stems, train=False)
+    if use_ddp:
+        # Build datasets up front to pass to DistributedSampler
+        from data.dataset_oai_raw_fixedpatch import OAIPairedPatch
+        expand_factor = float(cfg.get("expand_factor", 1.25))
+        fg_prob = float(cfg.get("fg_sampling_prob", 0.5))
+        tr_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], tr_stems,
+                               cfg["patch_size"], expand_factor, fg_prob, True)
+        va_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], va_stems,
+                               cfg["patch_size"], expand_factor, fg_prob, False)
+        train_sampler = DistributedSampler(tr_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        val_sampler   = DistributedSampler(va_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        train_loader  = DataLoader(tr_ds, batch_size=int(cfg["batch_size"]), sampler=train_sampler,
+                                   num_workers=int(cfg["num_workers"]), pin_memory=False, drop_last=True)
+        val_loader    = DataLoader(va_ds, batch_size=int(cfg["batch_size"]), sampler=val_sampler,
+                                   num_workers=int(cfg["num_workers"]), pin_memory=False, drop_last=False)
+    else:
+        train_sampler = None
+        train_loader  = make_loader(cfg, tr_stems, train=True)
+        val_loader    = make_loader(cfg, va_stems, train=False)
 
     # model
     model = MEUNet3D(
@@ -583,6 +628,9 @@ def main(cfg_path: str):
         cfg["dec_channels"],
         cfg["norm"],
     ).to(device)
+
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank])
 
     # loss for monitoring (and optionally training)
     crit = DiceCELoss(cfg["n_classes"])
@@ -667,6 +715,9 @@ def main(cfg_path: str):
         else:
             lambda_moment3_eff = lambda_moment3
 
+        if use_ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         model.train()
         loss_sum_total = 0.0
         loss_sum_seg_logged = 0.0
@@ -689,7 +740,7 @@ def main(cfg_path: str):
 
         for i, batch in enumerate(train_loader):
 
-            # TRUE EXP-only mode 
+            # TRUE EXP-only mode
             expanded = True if shape_on == "exp" else (i % 2 == 0)
 
             img = (batch["exp_img"] if expanded else batch["std_img"]).to(device, non_blocking=True)
@@ -734,6 +785,8 @@ def main(cfg_path: str):
                 moment_inv_loss = logits.new_tensor(0.0)
                 moment2_err = logits.new_tensor(0.0)
                 moment3_err = logits.new_tensor(0.0)
+                m2_errs_per_class = {c: logits.new_tensor(0.0) for c in moment2_classes}
+                m3_errs_per_class = {c: logits.new_tensor(0.0) for c in moment3_classes}
 
                 if apply_shape:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
@@ -913,7 +966,7 @@ def main(cfg_path: str):
                 loss_sum_moment3_err_per_class[c] += float(e.detach())
             n_it += 1
 
-            if i % log_every == 0:
+            if is_main and i % log_every == 0:
                 print(
                     f"[E{epoch:03d} i{i:04d} {'EXP' if expanded else 'STD'}] "
                     f"tot={total_loss_v:.4f} "
@@ -952,6 +1005,33 @@ def main(cfg_path: str):
             del lbl
             del batch
 
+        # All-reduce epoch train loss sums across ranks before computing averages
+        if use_ddp:
+            n_m2c = len(moment2_classes)
+            per_class_m2 = [loss_sum_moment2_err_per_class[c] for c in moment2_classes]
+            per_class_m3 = [loss_sum_moment3_err_per_class[c] for c in moment3_classes]
+            t = torch.tensor(
+                [loss_sum_total, loss_sum_seg_logged, loss_sum_seg_bw, loss_sum_vol,
+                 loss_sum_cent, loss_sum_avgdist, loss_sum_avgdist_axis,
+                 loss_sum_avgdist_axis_z, loss_sum_avgdist_axis_y, loss_sum_avgdist_axis_x,
+                 loss_sum_moment2, loss_sum_moment3, loss_sum_moment_inv,
+                 loss_sum_moment2_err, loss_sum_moment3_err, float(n_it)]
+                + per_class_m2 + per_class_m3,
+                device=device, dtype=torch.float64,
+            )
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            vals = t.cpu().tolist()
+            (loss_sum_total, loss_sum_seg_logged, loss_sum_seg_bw, loss_sum_vol,
+             loss_sum_cent, loss_sum_avgdist, loss_sum_avgdist_axis,
+             loss_sum_avgdist_axis_z, loss_sum_avgdist_axis_y, loss_sum_avgdist_axis_x,
+             loss_sum_moment2, loss_sum_moment3, loss_sum_moment_inv,
+             loss_sum_moment2_err, loss_sum_moment3_err, n_it_f) = vals[:16]
+            n_it = int(n_it_f)
+            for idx, c in enumerate(moment2_classes):
+                loss_sum_moment2_err_per_class[c] = vals[16 + idx]
+            for idx, c in enumerate(moment3_classes):
+                loss_sum_moment3_err_per_class[c] = vals[16 + n_m2c + idx]
+
         # epoch averages
         loss_tr_total = loss_sum_total / max(1, n_it)
         loss_tr_seg_logged = loss_sum_seg_logged / max(1, n_it)
@@ -971,10 +1051,11 @@ def main(cfg_path: str):
         loss_tr_moment2_err_per_class = {c: loss_sum_moment2_err_per_class[c] / max(1, n_it) for c in moment2_classes}
         loss_tr_moment3_err_per_class = {c: loss_sum_moment3_err_per_class[c] / max(1, n_it) for c in moment3_classes}
 
-        # validation (STD only)
+        # validation — all ranks participate, then metrics are all_reduced
         model.eval()
         loss_va_seg = 0.0
-        dices = None
+        dices_sum = None
+        n_va = 0
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["std_img"].to(device, non_blocking=True)
@@ -987,10 +1068,27 @@ def main(cfg_path: str):
                     loss_va_seg += float(crit(logits, y_rs))
 
                 d = np.array(soft_dice_per_class(logits, y_rs, cfg["n_classes"]))
-                dices = d if dices is None else (dices + d)
+                dices_sum = d if dices_sum is None else (dices_sum + d)
+                n_va += 1
 
-        loss_va_seg = loss_va_seg / max(1, len(val_loader)) if monitor_seg_loss else 0.0
-        dices = dices / max(1, len(val_loader))
+        if dices_sum is None:
+            dices_sum = np.zeros(cfg["n_classes"] - 1)
+
+        if use_ddp:
+            va_t = torch.tensor(
+                [loss_va_seg, float(n_va)] + dices_sum.tolist(),
+                device=device, dtype=torch.float64,
+            )
+            dist.all_reduce(va_t, op=dist.ReduceOp.SUM)
+            va_vals = va_t.cpu().tolist()
+            loss_va_seg = va_vals[0]
+            n_va_total = int(va_vals[1])
+            dices_sum = np.array(va_vals[2:])
+        else:
+            n_va_total = n_va
+
+        loss_va_seg = loss_va_seg / max(1, n_va_total) if monitor_seg_loss else 0.0
+        dices = dices_sum / max(1, n_va_total)
         meanFGDice = float(dices.mean()) if dices is not None else 0.0
 
         row = {
@@ -1024,10 +1122,11 @@ def main(cfg_path: str):
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
 
-        rows.append(row)
-        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        if is_main:
+            rows.append(row)
+            pd.DataFrame(rows).to_csv(csv_path, index=False)
 
-        if use_wandb:
+        if use_wandb and is_main:
             wandb.log({
                 # total and seg monitoring
                 "train/total":          loss_tr_total,
@@ -1068,13 +1167,14 @@ def main(cfg_path: str):
                 "schedule/barrier_t":       barrier_t,
             }, step=epoch)
 
-        # periodic checkpoints
-        if ckpt_every > 0 and (epoch % ckpt_every == 0):
-            torch.save(model.state_dict(), workdir / f"checkpoint_ep{epoch:03d}.pt")
+        # periodic checkpoints (rank 0 only)
+        model_state = model.module.state_dict() if use_ddp else model.state_dict()
+        if is_main and ckpt_every > 0 and (epoch % ckpt_every == 0):
+            torch.save(model_state, workdir / f"checkpoint_ep{epoch:03d}.pt")
             torch.save(
                 {
                     "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": model_state,
                     "optimizer_state_dict": opt.state_dict(),
                     "best_metric": best_metric,
                     "config": cfg,
@@ -1086,41 +1186,51 @@ def main(cfg_path: str):
         if metric > best_metric:
             best_metric = metric
             patience = 0
-            torch.save(model.state_dict(), workdir / "checkpoint_best.pt")
+            if is_main:
+                torch.save(model_state, workdir / "checkpoint_best.pt")
         else:
             patience += 1
 
-        plot_progress(workdir)
+        if is_main:
+            plot_progress(workdir)
 
-        print(
-            f"[E{epoch:03d}] "
-            f"train tot={loss_tr_total:.4f} "
-            f"seg(log)={loss_tr_seg_logged:.4f} "
-            f"seg(bw)={loss_tr_seg_bw:.4f} "
-            f"vol={loss_tr_vol:.4f} "
-            f"cent={loss_tr_cent:.4f} | "
-            f"avgdist={loss_tr_avgdist:.4f} "
-            f"avgdist_axis={loss_tr_avgdist_axis:.4f} "
-            f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
-            f"m2={loss_tr_moment2:.4f}(err={loss_tr_moment2_err:.2e}) "
-            f"m3={loss_tr_moment3:.4f}(err={loss_tr_moment3_err:.2e}) "
-            f"minv={loss_tr_moment_inv:.4f} | "
-            f"val seg={loss_va_seg:.4f} "
-            f"meanFGDice={meanFGDice:.4f} | "
-            f"best={best_metric:.4f} "
-            f"pat={patience}/{early_pat}"
-        )
+        if is_main:
+            print(
+                f"[E{epoch:03d}] "
+                f"train tot={loss_tr_total:.4f} "
+                f"seg(log)={loss_tr_seg_logged:.4f} "
+                f"seg(bw)={loss_tr_seg_bw:.4f} "
+                f"vol={loss_tr_vol:.4f} "
+                f"cent={loss_tr_cent:.4f} | "
+                f"avgdist={loss_tr_avgdist:.4f} "
+                f"avgdist_axis={loss_tr_avgdist_axis:.4f} "
+                f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
+                f"m2={loss_tr_moment2:.4f}(err={loss_tr_moment2_err:.2e}) "
+                f"m3={loss_tr_moment3:.4f}(err={loss_tr_moment3_err:.2e}) "
+                f"minv={loss_tr_moment_inv:.4f} | "
+                f"val seg={loss_va_seg:.4f} "
+                f"meanFGDice={meanFGDice:.4f} | "
+                f"best={best_metric:.4f} "
+                f"pat={patience}/{early_pat}"
+            )
 
         if patience >= early_pat:
-            print("Early stopping.")
+            if is_main:
+                print("Early stopping.")
             break
 
-    torch.save(model.state_dict(), workdir / "checkpoint_final.pt")
+    if is_main:
+        model_state = model.module.state_dict() if use_ddp else model.state_dict()
+        torch.save(model_state, workdir / "checkpoint_final.pt")
     dt = time.time() - t0_all
-    print(f"Done. Total time: {dt/3600:.2f}h. Workdir: {workdir}")
+    if is_main:
+        print(f"Done. Total time: {dt/3600:.2f}h. Workdir: {workdir}")
 
-    if use_wandb:
+    if use_wandb and is_main:
         wandb.finish()
+
+    if use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ norm: batch
 
 # training / loader
 batch_size: 2
-num_workers: 8
+num_workers: 6
 fg_sampling_prob: 0.5
 
 
@@ -76,11 +76,11 @@ moment3_warmup_end: 200       # fully at 0.05 by epoch 200
 lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
 
 moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
-moment2_tolerance: 0.05
-moment3_tolerance: 0.005  # updated according to values
+moment2_tolerance: 0.001
+moment3_tolerance: 0.0005  # updated according to values
 moment_inv_tolerance: 0.01
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
 wandb_run_name: moments_fractional_sqrt_diag 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_gamma1
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_gamma1_tolerance
