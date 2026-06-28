@@ -630,7 +630,8 @@ def main(cfg_path: str):
     ).to(device)
 
     if use_ddp:
-        model = DDP(model, device_ids=[local_rank])
+        # MEUNet3D has two output heads (logit1/logit2); only one is used per step
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     # loss for monitoring (and optionally training)
     crit = DiceCELoss(cfg["n_classes"])
