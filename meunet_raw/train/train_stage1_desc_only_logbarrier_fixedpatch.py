@@ -638,9 +638,14 @@ def main(cfg_path: str):
     # loss for monitoring (and optionally training)
     crit = DiceCELoss(cfg["n_classes"])
 
+    base_lr = float(cfg.get("lr", 9e-4))
+    effective_lr = base_lr * (world_size ** 0.5) if use_ddp else base_lr
+    if is_main and use_ddp:
+        print(f"LR scaled: {base_lr:.2e} -> {effective_lr:.2e} (sqrt({world_size}) rule)")
+
     opt = torch.optim.Adam(
         model.parameters(),
-        lr=float(cfg.get("lr", 9e-4)),
+        lr=effective_lr,
         weight_decay=float(cfg.get("weight_decay", 1e-5)),
     )
 
