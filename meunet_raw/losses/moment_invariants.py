@@ -191,22 +191,32 @@ def compute_moment_invariants_barrier(
     n_classes,
     moment_class,
     barrier,
-    inv_tolerance=0.01,
+    lambda_J1=1.0,
+    lambda_J2=1.0,
+    lambda_J3=1.0,
+    tol_J1=0.01,
+    tol_J2=1e-3,
+    tol_J3=1e-4,
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    return_stats=False,
     gamma=1.0,
 ):
     """
     Log-barrier on the three rotation-invariant scalars derived from the
     2nd-order covariance matrix (Sadjadi & Hall, 1980):
 
-        J1 = trace(Sigma)                     -- total spread
-        J2 = sum of 2x2 principal minors      -- pairwise spread product
-        J3 = det(Sigma)                        -- volume of the ellipsoid
+        J1 = trace(Sigma)                     -- total spread         O(sigma^2)
+        J2 = sum of 2x2 principal minors      -- pairwise spread      O(sigma^4)
+        J3 = det(Sigma)                        -- ellipsoid volume     O(sigma^6)
 
     Invariant to translation, rigid rotation, and (approximately) scale.
+    Per-invariant lambdas and tolerances account for the large scale differences
+    between J1/J2/J3 (sigma^2 vs sigma^4 vs sigma^6). Set lambda_J* = 0 to skip.
+
     gamma: normalization order (1.0 = weighted average, 5/3 = fractional mass).
+    return_stats: if True, returns (loss, stats) where stats is a tensor [err_J1, err_J2, err_J3].
     """
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -214,6 +224,8 @@ def compute_moment_invariants_barrier(
     )
 
     if not has_class.any():
+        if return_stats:
+            return logits_ref.new_tensor(0.0), logits_ref.new_zeros(3)
         return logits_ref.new_tensor(0.0)
 
     def _cov(w, c, w_sum):
@@ -241,9 +253,22 @@ def compute_moment_invariants_barrier(
     gJ1, gJ2, gJ3 = _invariants(*_cov(gt_mask, gt_c, gt_sum))
 
     loss = logits_ref.new_tensor(0.0)
-    for pj, gj in [(pJ1, gJ1), (pJ2, gJ2), (pJ3, gJ3)]:
-        loss = loss + _barrier_pair(barrier, pj[has_class], gj[has_class], inv_tolerance)
+    inv_terms = [
+        (lambda_J1, tol_J1, pJ1, gJ1),
+        (lambda_J2, tol_J2, pJ2, gJ2),
+        (lambda_J3, tol_J3, pJ3, gJ3),
+    ]
+    errors = []
+    for lam, tol, pj, gj in inv_terms:
+        pj_valid, gj_valid = pj[has_class], gj[has_class]
+        if lam > 0.0:
+            loss = loss + lam * _barrier_pair(barrier, pj_valid, gj_valid, tol)
+        if return_stats:
+            errors.append((pj_valid - gj_valid).abs().mean())
 
+    if return_stats:
+        stats = torch.stack(errors) if errors else logits_ref.new_zeros(3)
+        return loss, stats
     return loss
 
 

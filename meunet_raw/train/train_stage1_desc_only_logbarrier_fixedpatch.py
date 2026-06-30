@@ -630,6 +630,8 @@ def main(cfg_path: str):
     ).to(device)
 
     if use_ddp:
+        # Sync BN statistics across GPUs — critical with small per-rank batch sizes
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
         # MEUNet3D has two output heads (logit1/logit2); only one is used per step
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -662,7 +664,9 @@ def main(cfg_path: str):
     lambda_avgdist_axis = float(cfg.get("lambda_avgdist_axis", cfg.get("lambda_distance_axis", 0.0)))
     lambda_moment2 = float(cfg.get("lambda_moment2", 0.0))
     lambda_moment3 = float(cfg.get("lambda_moment3", 0.0))
-    lambda_moment_inv = float(cfg.get("lambda_moment_inv", 0.0))
+    lambda_moment_inv_J1 = float(cfg.get("lambda_moment_inv_J1", 1.0))
+    lambda_moment_inv_J2 = float(cfg.get("lambda_moment_inv_J2", 1.0))
+    lambda_moment_inv_J3 = float(cfg.get("lambda_moment_inv_J3", 1.0))
     # linear warmup for moment3: ramp from 0 -> lambda_moment3 between these epochs
     moment3_warmup_start = int(cfg.get("moment3_warmup_start", 0))
     moment3_warmup_end   = int(cfg.get("moment3_warmup_end",   0))  # 0 = no warmup
@@ -677,7 +681,9 @@ def main(cfg_path: str):
     avgdist_axis_tolerance = float(cfg.get("avgdist_axis_tolerance", 0.05))
     moment2_tolerance = float(cfg.get("moment2_tolerance", 0.02))
     moment3_tolerance = float(cfg.get("moment3_tolerance", 0.01))
-    moment_inv_tolerance = float(cfg.get("moment_inv_tolerance", 0.01))
+    moment_inv_J1_tolerance = float(cfg.get("moment_inv_J1_tolerance", 0.01))
+    moment_inv_J2_tolerance = float(cfg.get("moment_inv_J2_tolerance", 1e-3))
+    moment_inv_J3_tolerance = float(cfg.get("moment_inv_J3_tolerance", 1e-4))
     moment2_sqrt_diagonal = bool(cfg.get("moment2_sqrt_diagonal", True))
     moment3_sqrt_diagonal = bool(cfg.get("moment3_sqrt_diagonal", True))
     # "gamma1" (default): weighted average, tractable gradients, no spreading artefacts
@@ -735,8 +741,13 @@ def main(cfg_path: str):
         loss_sum_moment_inv = 0.0
         loss_sum_moment2_err = 0.0
         loss_sum_moment3_err = 0.0
+        loss_sum_moment_inv_err = 0.0
+        loss_sum_moment_inv_J1_err = 0.0
+        loss_sum_moment_inv_J2_err = 0.0
+        loss_sum_moment_inv_J3_err = 0.0
         loss_sum_moment2_err_per_class = {c: 0.0 for c in moment2_classes}
         loss_sum_moment3_err_per_class = {c: 0.0 for c in moment3_classes}
+        loss_sum_moment_inv_err_per_class = {c: 0.0 for c in moment_inv_classes}
         n_it = 0
 
         for i, batch in enumerate(train_loader):
@@ -786,8 +797,10 @@ def main(cfg_path: str):
                 moment_inv_loss = logits.new_tensor(0.0)
                 moment2_err = logits.new_tensor(0.0)
                 moment3_err = logits.new_tensor(0.0)
+                moment_inv_stats = logits.new_zeros(3)  # [err_J1, err_J2, err_J3]
                 m2_errs_per_class = {c: logits.new_tensor(0.0) for c in moment2_classes}
                 m3_errs_per_class = {c: logits.new_tensor(0.0) for c in moment3_classes}
+                minv_errs_per_class = {c: logits.new_zeros(3) for c in moment_inv_classes}
 
                 if apply_shape:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
@@ -895,22 +908,33 @@ def main(cfg_path: str):
                         moment3_loss = torch.stack(m3s).mean() if m3s else logits.new_tensor(0.0)
                         moment3_err  = torch.stack(list(m3_errs_per_class.values())).mean() if m3_errs_per_class else logits.new_tensor(0.0)
 
-                    if lambda_moment_inv > 0.0 and len(moment_inv_classes) > 0:
+                    _any_inv_active = any(l > 0.0 for l in [lambda_moment_inv_J1, lambda_moment_inv_J2, lambda_moment_inv_J3])
+                    if _any_inv_active and len(moment_inv_classes) > 0:
                         mis = []
                         for c in moment_inv_classes:
-                            mis.append(
-                                compute_moment_invariants_barrier(
-                                    logits=logits,
-                                    target=lbl_rs,
-                                    n_classes=cfg["n_classes"],
-                                    moment_class=c,
-                                    barrier=barrier,
-                                    inv_tolerance=moment_inv_tolerance,
-                                    centroid_norm=centroid_norm,
-                                    gamma=moment_inv_gamma,
-                                )
+                            l_c, s_c = compute_moment_invariants_barrier(
+                                logits=logits,
+                                target=lbl_rs,
+                                n_classes=cfg["n_classes"],
+                                moment_class=c,
+                                barrier=barrier,
+                                lambda_J1=lambda_moment_inv_J1,
+                                lambda_J2=lambda_moment_inv_J2,
+                                lambda_J3=lambda_moment_inv_J3,
+                                tol_J1=moment_inv_J1_tolerance,
+                                tol_J2=moment_inv_J2_tolerance,
+                                tol_J3=moment_inv_J3_tolerance,
+                                centroid_norm=centroid_norm,
+                                return_stats=True,
+                                gamma=moment_inv_gamma,
                             )
+                            mis.append(l_c)
+                            minv_errs_per_class[c] = s_c
                         moment_inv_loss = torch.stack(mis).mean() if mis else logits.new_tensor(0.0)
+                        moment_inv_stats = (
+                            torch.stack(list(minv_errs_per_class.values())).mean(dim=0)
+                            if minv_errs_per_class else logits.new_zeros(3)
+                        )
 
                 total_loss = (
                     seg_loss_bw
@@ -920,13 +944,15 @@ def main(cfg_path: str):
                     + lambda_avgdist_axis * avgdist_axis_loss
                     + lambda_moment2 * moment2_loss
                     + lambda_moment3_eff * moment3_loss
-                    + lambda_moment_inv * moment_inv_loss
+                    + moment_inv_loss
                 )
 
                 if not total_loss.requires_grad:
                     continue
 
             scaler.scale(total_loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg.get("grad_clip", 5.0)))
             scaler.step(opt)
             scaler.update()
 
@@ -945,6 +971,7 @@ def main(cfg_path: str):
             moment_inv_loss_v = float(moment_inv_loss.detach())
             moment2_err_v     = float(moment2_err.detach())
             moment3_err_v     = float(moment3_err.detach())
+            moment_inv_stats_v = moment_inv_stats.detach().cpu().tolist()  # [J1, J2, J3]
 
             loss_sum_total += total_loss_v
             loss_sum_seg_logged += seg_loss_logged_v
@@ -961,10 +988,16 @@ def main(cfg_path: str):
             loss_sum_moment_inv += moment_inv_loss_v
             loss_sum_moment2_err += moment2_err_v
             loss_sum_moment3_err += moment3_err_v
+            loss_sum_moment_inv_err    += sum(moment_inv_stats_v) / max(1, len(moment_inv_stats_v))
+            loss_sum_moment_inv_J1_err += moment_inv_stats_v[0]
+            loss_sum_moment_inv_J2_err += moment_inv_stats_v[1]
+            loss_sum_moment_inv_J3_err += moment_inv_stats_v[2]
             for c, e in m2_errs_per_class.items():
                 loss_sum_moment2_err_per_class[c] += float(e.detach())
             for c, e in m3_errs_per_class.items():
                 loss_sum_moment3_err_per_class[c] += float(e.detach())
+            for c, s in minv_errs_per_class.items():
+                loss_sum_moment_inv_err_per_class[c] += float(s.detach().mean())
             n_it += 1
 
             if is_main and i % log_every == 0:
@@ -979,7 +1012,7 @@ def main(cfg_path: str):
                     f"avgdist_axis={avgdist_axis_loss_v:.4f} "
                     f"m2={moment2_loss_v:.4f}(err={moment2_err_v:.2e}) "
                     f"m3={moment3_loss_v:.4f}(err={moment3_err_v:.2e}) "
-                    f"minv={moment_inv_loss_v:.4f} "
+                    f"minv={moment_inv_loss_v:.4f}(J1={moment_inv_stats_v[0]:.2e},J2={moment_inv_stats_v[1]:.2e},J3={moment_inv_stats_v[2]:.2e}) "
                     f"t={barrier_t:.2f} "
                     f"lr={lr_now(opt):.2e}"
                 )
@@ -1000,8 +1033,10 @@ def main(cfg_path: str):
             del moment_inv_loss
             del moment2_err
             del moment3_err
+            del moment_inv_stats
             del m2_errs_per_class
             del m3_errs_per_class
+            del minv_errs_per_class
             del img
             del lbl
             del batch
@@ -1009,15 +1044,20 @@ def main(cfg_path: str):
         # All-reduce epoch train loss sums across ranks before computing averages
         if use_ddp:
             n_m2c = len(moment2_classes)
-            per_class_m2 = [loss_sum_moment2_err_per_class[c] for c in moment2_classes]
-            per_class_m3 = [loss_sum_moment3_err_per_class[c] for c in moment3_classes]
+            n_m3c = len(moment3_classes)
+            per_class_m2   = [loss_sum_moment2_err_per_class[c]   for c in moment2_classes]
+            per_class_m3   = [loss_sum_moment3_err_per_class[c]   for c in moment3_classes]
+            per_class_minv = [loss_sum_moment_inv_err_per_class[c] for c in moment_inv_classes]
             t = torch.tensor(
                 [loss_sum_total, loss_sum_seg_logged, loss_sum_seg_bw, loss_sum_vol,
                  loss_sum_cent, loss_sum_avgdist, loss_sum_avgdist_axis,
                  loss_sum_avgdist_axis_z, loss_sum_avgdist_axis_y, loss_sum_avgdist_axis_x,
                  loss_sum_moment2, loss_sum_moment3, loss_sum_moment_inv,
-                 loss_sum_moment2_err, loss_sum_moment3_err, float(n_it)]
-                + per_class_m2 + per_class_m3,
+                 loss_sum_moment2_err, loss_sum_moment3_err,
+                 loss_sum_moment_inv_err, loss_sum_moment_inv_J1_err,
+                 loss_sum_moment_inv_J2_err, loss_sum_moment_inv_J3_err,
+                 float(n_it)]
+                + per_class_m2 + per_class_m3 + per_class_minv,
                 device=device, dtype=torch.float64,
             )
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -1026,12 +1066,17 @@ def main(cfg_path: str):
              loss_sum_cent, loss_sum_avgdist, loss_sum_avgdist_axis,
              loss_sum_avgdist_axis_z, loss_sum_avgdist_axis_y, loss_sum_avgdist_axis_x,
              loss_sum_moment2, loss_sum_moment3, loss_sum_moment_inv,
-             loss_sum_moment2_err, loss_sum_moment3_err, n_it_f) = vals[:16]
+             loss_sum_moment2_err, loss_sum_moment3_err,
+             loss_sum_moment_inv_err, loss_sum_moment_inv_J1_err,
+             loss_sum_moment_inv_J2_err, loss_sum_moment_inv_J3_err,
+             n_it_f) = vals[:20]
             n_it = int(n_it_f)
             for idx, c in enumerate(moment2_classes):
-                loss_sum_moment2_err_per_class[c] = vals[16 + idx]
+                loss_sum_moment2_err_per_class[c] = vals[20 + idx]
             for idx, c in enumerate(moment3_classes):
-                loss_sum_moment3_err_per_class[c] = vals[16 + n_m2c + idx]
+                loss_sum_moment3_err_per_class[c] = vals[20 + n_m2c + idx]
+            for idx, c in enumerate(moment_inv_classes):
+                loss_sum_moment_inv_err_per_class[c] = vals[20 + n_m2c + n_m3c + idx]
 
         # epoch averages
         loss_tr_total = loss_sum_total / max(1, n_it)
@@ -1049,8 +1094,13 @@ def main(cfg_path: str):
         loss_tr_moment_inv = loss_sum_moment_inv / max(1, n_it)
         loss_tr_moment2_err = loss_sum_moment2_err / max(1, n_it)
         loss_tr_moment3_err = loss_sum_moment3_err / max(1, n_it)
-        loss_tr_moment2_err_per_class = {c: loss_sum_moment2_err_per_class[c] / max(1, n_it) for c in moment2_classes}
-        loss_tr_moment3_err_per_class = {c: loss_sum_moment3_err_per_class[c] / max(1, n_it) for c in moment3_classes}
+        loss_tr_moment_inv_err    = loss_sum_moment_inv_err    / max(1, n_it)
+        loss_tr_moment_inv_J1_err = loss_sum_moment_inv_J1_err / max(1, n_it)
+        loss_tr_moment_inv_J2_err = loss_sum_moment_inv_J2_err / max(1, n_it)
+        loss_tr_moment_inv_J3_err = loss_sum_moment_inv_J3_err / max(1, n_it)
+        loss_tr_moment2_err_per_class   = {c: loss_sum_moment2_err_per_class[c]   / max(1, n_it) for c in moment2_classes}
+        loss_tr_moment3_err_per_class   = {c: loss_sum_moment3_err_per_class[c]   / max(1, n_it) for c in moment3_classes}
+        loss_tr_moment_inv_err_per_class = {c: loss_sum_moment_inv_err_per_class[c] / max(1, n_it) for c in moment_inv_classes}
 
         # validation — all ranks participate, then metrics are all_reduced
         model.eval()
@@ -1119,6 +1169,10 @@ def main(cfg_path: str):
             "loss_tr_moment_inv": loss_tr_moment_inv,
             "loss_tr_moment2_err": loss_tr_moment2_err,
             "loss_tr_moment3_err": loss_tr_moment3_err,
+            "loss_tr_moment_inv_err": loss_tr_moment_inv_err,
+            "loss_tr_moment_inv_J1_err": loss_tr_moment_inv_J1_err,
+            "loss_tr_moment_inv_J2_err": loss_tr_moment_inv_J2_err,
+            "loss_tr_moment_inv_J3_err": loss_tr_moment_inv_J3_err,
         }
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
@@ -1146,9 +1200,14 @@ def main(cfg_path: str):
                 "desc/m3_barrier":          loss_tr_moment3,
                 "desc/m3_err":              loss_tr_moment3_err,
                 "desc/minv_barrier":        loss_tr_moment_inv,
+                "desc/minv_err":            loss_tr_moment_inv_err,
+                "desc/minv_err_J1":         loss_tr_moment_inv_J1_err,
+                "desc/minv_err_J2":         loss_tr_moment_inv_J2_err,
+                "desc/minv_err_J3":         loss_tr_moment_inv_J3_err,
                 # per-anatomy moment errors
                 **{f"desc/m2_err_c{c}": loss_tr_moment2_err_per_class[c] for c in moment2_classes},
                 **{f"desc/m3_err_c{c}": loss_tr_moment3_err_per_class[c] for c in moment3_classes},
+                **{f"desc/minv_err_c{c}": loss_tr_moment_inv_err_per_class[c] for c in moment_inv_classes},
                 # weighted contributions (lambda × barrier) — what drives the gradient
                 "contrib/vol":          lambda_volume    * loss_tr_vol,
                 "contrib/cent":         lambda_centroid  * loss_tr_cent,
@@ -1156,7 +1215,7 @@ def main(cfg_path: str):
                 "contrib/avgdist_axis": lambda_avgdist_axis * loss_tr_avgdist_axis,
                 "contrib/m2":           lambda_moment2   * loss_tr_moment2,
                 "contrib/m3":           lambda_moment3_eff * loss_tr_moment3,
-                "contrib/minv":         lambda_moment_inv  * loss_tr_moment_inv,
+                "contrib/minv":         loss_tr_moment_inv,
                 # validation
                 "val/seg":              loss_va_seg,
                 "val/meanFGDice":       meanFGDice,
@@ -1208,7 +1267,7 @@ def main(cfg_path: str):
                 f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
                 f"m2={loss_tr_moment2:.4f}(err={loss_tr_moment2_err:.2e}) "
                 f"m3={loss_tr_moment3:.4f}(err={loss_tr_moment3_err:.2e}) "
-                f"minv={loss_tr_moment_inv:.4f} | "
+                f"minv={loss_tr_moment_inv:.4f}(J1={loss_tr_moment_inv_J1_err:.2e},J2={loss_tr_moment_inv_J2_err:.2e},J3={loss_tr_moment_inv_J3_err:.2e}) | "
                 f"val seg={loss_va_seg:.4f} "
                 f"meanFGDice={meanFGDice:.4f} | "
                 f"best={best_metric:.4f} "
