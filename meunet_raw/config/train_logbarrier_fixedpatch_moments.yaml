@@ -60,7 +60,7 @@ shape_on: both                  # apply shape losses on EXP and STD patches
 lambda_volume: 1.0              # small now for first experiment logbarrier
 lambda_centroid: 5.0            # small now for first experiment logbarrier
 lambda_avgdist: 0.0             # radial mean distance to centroid barrier
-lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
+lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
 ##logbarrier toggles
