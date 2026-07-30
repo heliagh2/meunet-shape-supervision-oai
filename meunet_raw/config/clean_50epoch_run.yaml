@@ -90,5 +90,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: moments_fractional_sqrt_diag 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_gamma1_fixVolumeCenttolerance_LR
+wandb_run_name: 50_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50_epochs_center_volume
