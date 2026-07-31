@@ -60,7 +60,7 @@ shape_on: both                  # apply shape losses on EXP and STD patches
 lambda_volume: 1.0              # small now for first experiment logbarrier
 lambda_centroid: 5.0            # small now for first experiment logbarrier
 lambda_avgdist: 0.0             # radial mean distance to centroid barrier
-lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
+lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
 ##logbarrier toggles
@@ -90,5 +90,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: 50_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50_epochs_center_volume
+wandb_run_name: 50_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xavg_dist_axis_tolavgdistaxis0.05
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50_epochs_center_volume_avgdist_axis
