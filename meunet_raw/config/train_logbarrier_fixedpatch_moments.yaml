@@ -36,7 +36,7 @@ lr: 0.0009
 weight_decay: 1.0e-05
 amp: true
 
-epochs: 600
+epochs: 50
 early_stop_patience: 100
 min_lr: 1.0e-06
 deep_supervision_weight: 0.5
@@ -89,5 +89,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: moments_fractional_sqrt_diag 
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/Moments2and3_gamma1_fixVolumeCenttolerance_LR
+wandb_run_name: 50_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_0.10xmoment2_tolMoment20.10_0.21xmoment3_tolMoment30.01
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50epochs_Moments2and3_gamma1
