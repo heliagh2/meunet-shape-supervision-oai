@@ -90,4 +90,4 @@ moment_inv_J3_tolerance: 1.0e-5
 use_wandb: true
 wandb_project: meunet-shape-supervision
 wandb_run_name: 50_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_0.10xmoment2_tolMoment20.10_1xmoment3_tolMoment30.01
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50epochs_Moments2and3_gamma1
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50epochs_Moments2and3_gamma1_biggerM2
