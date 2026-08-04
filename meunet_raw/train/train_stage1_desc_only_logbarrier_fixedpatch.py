@@ -760,6 +760,10 @@ def main(cfg_path: str):
             # TRUE EXP-only mode
             expanded = True if shape_on == "exp" else (i % 2 == 0)
 
+            # diag/off-diag moment breakdown printed on the first batch of every 10th
+            # epoch (plus epoch 1), to spot-check without flooding the log
+            moment_verbose = is_main and i == 0 and (epoch == 1 or epoch % 10 == 0)
+
             img = (batch["exp_img"] if expanded else batch["std_img"]).to(device, non_blocking=True)
             lbl = (batch["exp_lbl"] if expanded else batch["std_lbl"]).to(device, non_blocking=True)
 
@@ -887,6 +891,7 @@ def main(cfg_path: str):
                                 return_stats=True,
                                 gamma=moment2_gamma,
                                 sqrt_diagonal=moment2_sqrt_diagonal,
+                                verbose=moment_verbose,
                             )
                             m2s.append(l_c)
                             m2_errs_per_class[c] = e_c
@@ -907,6 +912,7 @@ def main(cfg_path: str):
                                 return_stats=True,
                                 gamma=moment3_gamma,
                                 sqrt_diagonal=moment3_sqrt_diagonal,
+                                verbose=moment_verbose,
                             )
                             m3s.append(l_c)
                             m3_errs_per_class[c] = e_c

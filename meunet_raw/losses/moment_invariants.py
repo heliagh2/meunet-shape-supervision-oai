@@ -122,6 +122,7 @@ def compute_2nd_moment_barrier(
     return_stats=False,
     gamma=1.0,
     sqrt_diagonal=True,
+    verbose=False,
 ):
     """
     Log-barrier on the 6 normalized 2nd-order central moments.
@@ -165,17 +166,27 @@ def compute_2nd_moment_barrier(
     ]
 
     loss = logits_ref.new_tensor(0.0)
-    errors = [] if return_stats else None
+    errors = [] if (return_stats or verbose) else None
+    diag_errors = [] if verbose else None
+    offdiag_errors = [] if verbose else None
     for is_diag, pt, gt in terms:
         pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=gamma).squeeze(1)[has_class]
         gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=gamma).squeeze(1)[has_class]
         if sqrt_diagonal and is_diag:
             pred_m = torch.sqrt(pred_m.clamp(min=0) + eps)
             gt_m   = torch.sqrt(gt_m.clamp(min=0)   + eps)
-        if return_stats:
-            errors.append((pred_m - gt_m).abs().mean())
+        if return_stats or verbose:
+            err = (pred_m - gt_m).abs().mean()
+            errors.append(err)
+            if verbose:
+                (diag_errors if is_diag else offdiag_errors).append(float(err.detach()))
         loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
         del pt, gt, pred_m, gt_m
+
+    if verbose:
+        d = sum(diag_errors) / len(diag_errors)
+        o = sum(offdiag_errors) / len(offdiag_errors)
+        print(f"        [moment2 class={moment_class}] diag(sigma)_err={d:.3e}  offdiag(cov)_err={o:.3e}")
 
     if return_stats:
         mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
@@ -287,6 +298,7 @@ def compute_3rd_moment_barrier(
     return_stats=False,
     gamma=1.0,
     sqrt_diagonal=True,
+    verbose=False,
 ):
     """
     Log-barrier on all 10 normalized 3rd-order central moments.
@@ -336,7 +348,9 @@ def compute_3rd_moment_barrier(
     ]
 
     loss = logits_ref.new_tensor(0.0)
-    errors = [] if return_stats else None
+    errors = [] if (return_stats or verbose) else None
+    diag_errors = [] if verbose else None
+    offdiag_errors = [] if verbose else None
     for is_pure_cubic, pt, gt in terms:
         pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=gamma).squeeze(1)[has_class]
         gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=gamma).squeeze(1)[has_class]
@@ -344,12 +358,21 @@ def compute_3rd_moment_barrier(
             # signed sqrt: preserves skewness direction, amplifies gradient for small |m|
             pred_m = torch.sign(pred_m) * torch.sqrt(pred_m.abs() + eps)
             gt_m   = torch.sign(gt_m)   * torch.sqrt(gt_m.abs()   + eps)
-        if return_stats:
-            errors.append((pred_m - gt_m).abs().mean())
+        if return_stats or verbose:
+            err = (pred_m - gt_m).abs().mean()
+            errors.append(err)
+            if verbose:
+                (diag_errors if is_pure_cubic else offdiag_errors).append(float(err.detach()))
         loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
         del pt, gt, pred_m, gt_m
 
     del dz_p2, dy_p2, dx_p2, dz_g2, dy_g2, dx_g2
+
+    if verbose:
+        d = sum(diag_errors) / len(diag_errors)
+        o = sum(offdiag_errors) / len(offdiag_errors)
+        print(f"        [moment3 class={moment_class}] diag(skew)_err={d:.3e}  offdiag(mixed)_err={o:.3e}")
+
     if return_stats:
         mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
         return loss, mean_err
