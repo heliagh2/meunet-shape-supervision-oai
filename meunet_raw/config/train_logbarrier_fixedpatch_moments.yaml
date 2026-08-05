@@ -20,7 +20,7 @@ patch_size: [200, 200, 200]
 expand_factor: 2.0
 enc_channels: [16, 32, 64, 128]
 dec_channels: [16, 32, 64]
-norm: batch
+norm: instance
 
 # training / loader
 batch_size: 2
@@ -98,5 +98,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: 250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xmoment2_tolMoment20.10_1xmoment3_tolMoment30.01x0.5offDiag
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_Moments2and3_gamma1_offDiagSeparate
+wandb_run_name: 250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xmoment2_tolMoment20.10_1xmoment3_tolMoment30.01x0.5offDiag_instanceNorm
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_Moments2and3_gamma1_offDiagSeparate_instanceNorm
