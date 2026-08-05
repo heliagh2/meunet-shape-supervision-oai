@@ -116,6 +116,7 @@ def compute_2nd_moment_barrier(
     moment_class,
     barrier,
     moment_tolerance=0.02,
+    offdiag_tolerance=None,
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
@@ -131,22 +132,33 @@ def compute_2nd_moment_barrier(
       With sqrt_diagonal=True (default): square-rooted after normalization,
       giving per-axis standard deviations.  This amplifies gradient signal for
       thin structures (d(sqrt(eta))/d(eta) = 1/(2*sqrt(eta)) → large when small),
-      matching the behaviour of avgdist_axis.
+      matching the behaviour of avgdist_axis. Uses `moment_tolerance`.
 
     Off-diagonal (cross-covariances, can be negative) — mu_110, mu_101, mu_011:
-      Always kept raw; no sqrt since covariances can be negative.
+      Always kept raw; no sqrt since covariances can be negative. Uses
+      `offdiag_tolerance` (defaults to `moment_tolerance` if not given) — these
+      terms are typically an order of magnitude smaller in natural scale, so a
+      shared tolerance usually leaves them inert (always inside the band).
 
     gamma: normalization order (1.0 = weighted average, 5/3 = fractional mass).
+
+    Returns (diag_loss, offdiag_loss) normally, or (diag_loss, offdiag_loss,
+    mean_err) if return_stats=True — so diagonal and off-diagonal terms can be
+    weighted by separate lambdas at the call site.
     """
+    if offdiag_tolerance is None:
+        offdiag_tolerance = moment_tolerance
+
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
         logits, target, n_classes, moment_class, ignore_index, eps, centroid_norm
     )
 
     if not has_class.any():
+        z = logits_ref.new_tensor(0.0)
         if return_stats:
-            return logits_ref.new_tensor(0.0), logits_ref.new_tensor(0.0)
-        return logits_ref.new_tensor(0.0)
+            return z, z, z
+        return z, z
 
     dz_p = coords[:, 0:1] - pred_c[:, 0:1]
     dy_p = coords[:, 1:2] - pred_c[:, 1:2]
@@ -165,7 +177,8 @@ def compute_2nd_moment_barrier(
         (False, dy_p * dx_p, dy_g * dx_g),  # mu_011
     ]
 
-    loss = logits_ref.new_tensor(0.0)
+    diag_loss = logits_ref.new_tensor(0.0)
+    offdiag_loss = logits_ref.new_tensor(0.0)
     errors = [] if (return_stats or verbose) else None
     diag_errors = [] if verbose else None
     offdiag_errors = [] if verbose else None
@@ -180,7 +193,12 @@ def compute_2nd_moment_barrier(
             errors.append(err)
             if verbose:
                 (diag_errors if is_diag else offdiag_errors).append(float(err.detach()))
-        loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
+        tol = moment_tolerance if is_diag else offdiag_tolerance
+        term_loss = _barrier_pair(barrier, pred_m, gt_m, tol)
+        if is_diag:
+            diag_loss = diag_loss + term_loss
+        else:
+            offdiag_loss = offdiag_loss + term_loss
         del pt, gt, pred_m, gt_m
 
     if verbose:
@@ -190,8 +208,8 @@ def compute_2nd_moment_barrier(
 
     if return_stats:
         mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
-        return loss, mean_err
-    return loss
+        return diag_loss, offdiag_loss, mean_err
+    return diag_loss, offdiag_loss
 
 
 # --------------------------------------- 2nd order rotation-invariant moments -
@@ -292,6 +310,7 @@ def compute_3rd_moment_barrier(
     moment_class,
     barrier,
     moment_tolerance=0.01,
+    offdiag_tolerance=None,
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
@@ -307,21 +326,32 @@ def compute_3rd_moment_barrier(
       With sqrt_diagonal=True (default): signed sqrt applied after normalization.
       sign(m) * sqrt(|m|) preserves the skewness direction while amplifying
       gradient signal when skewness magnitude is small (thin/symmetric structures).
+      Uses `moment_tolerance`.
 
     Mixed and cross terms — mu_210, mu_201, mu_120, mu_021, mu_102, mu_012, mu_111:
-      Always kept raw (can be positive or negative).
+      Always kept raw (can be positive or negative). Uses `offdiag_tolerance`
+      (defaults to `moment_tolerance` if not given) — typically much smaller in
+      natural scale than the pure-cubic terms, so a shared tolerance usually
+      leaves them inert (always inside the band).
 
     gamma: normalization order (1.0 = weighted average, 2.0 = fractional mass).
+
+    Returns (diag_loss, offdiag_loss) normally, or (diag_loss, offdiag_loss,
+    mean_err) if return_stats=True.
     """
+    if offdiag_tolerance is None:
+        offdiag_tolerance = moment_tolerance
+
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
         logits, target, n_classes, moment_class, ignore_index, eps, centroid_norm
     )
 
     if not has_class.any():
+        z = logits_ref.new_tensor(0.0)
         if return_stats:
-            return logits_ref.new_tensor(0.0), logits_ref.new_tensor(0.0)
-        return logits_ref.new_tensor(0.0)
+            return z, z, z
+        return z, z
 
     dz_p = coords[:, 0:1] - pred_c[:, 0:1]
     dy_p = coords[:, 1:2] - pred_c[:, 1:2]
@@ -347,7 +377,8 @@ def compute_3rd_moment_barrier(
         (False, dz_p  * dy_p * dx_p, dz_g  * dy_g * dx_g), # mu_111
     ]
 
-    loss = logits_ref.new_tensor(0.0)
+    diag_loss = logits_ref.new_tensor(0.0)
+    offdiag_loss = logits_ref.new_tensor(0.0)
     errors = [] if (return_stats or verbose) else None
     diag_errors = [] if verbose else None
     offdiag_errors = [] if verbose else None
@@ -363,7 +394,12 @@ def compute_3rd_moment_barrier(
             errors.append(err)
             if verbose:
                 (diag_errors if is_pure_cubic else offdiag_errors).append(float(err.detach()))
-        loss = loss + _barrier_pair(barrier, pred_m, gt_m, moment_tolerance)
+        tol = moment_tolerance if is_pure_cubic else offdiag_tolerance
+        term_loss = _barrier_pair(barrier, pred_m, gt_m, tol)
+        if is_pure_cubic:
+            diag_loss = diag_loss + term_loss
+        else:
+            offdiag_loss = offdiag_loss + term_loss
         del pt, gt, pred_m, gt_m
 
     del dz_p2, dy_p2, dx_p2, dz_g2, dy_g2, dx_g2
@@ -375,5 +411,5 @@ def compute_3rd_moment_barrier(
 
     if return_stats:
         mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
-        return loss, mean_err
-    return loss
+        return diag_loss, offdiag_loss, mean_err
+    return diag_loss, offdiag_loss

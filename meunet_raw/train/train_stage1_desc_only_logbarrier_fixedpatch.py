@@ -669,6 +669,10 @@ def main(cfg_path: str):
     lambda_avgdist_axis = float(cfg.get("lambda_avgdist_axis", cfg.get("lambda_distance_axis", 0.0)))
     lambda_moment2 = float(cfg.get("lambda_moment2", 0.0))
     lambda_moment3 = float(cfg.get("lambda_moment3", 0.0))
+    # separate weight for the off-diagonal (cross-covariance / mixed-skew) terms —
+    # defaults to 0.0 so existing configs are unaffected unless explicitly opted in
+    lambda_moment2_offdiag = float(cfg.get("lambda_moment2_offdiag", 0.0))
+    lambda_moment3_offdiag = float(cfg.get("lambda_moment3_offdiag", 0.0))
     lambda_moment_inv_J1 = float(cfg.get("lambda_moment_inv_J1", 1.0))
     lambda_moment_inv_J2 = float(cfg.get("lambda_moment_inv_J2", 1.0))
     lambda_moment_inv_J3 = float(cfg.get("lambda_moment_inv_J3", 1.0))
@@ -686,6 +690,11 @@ def main(cfg_path: str):
     avgdist_axis_tolerance = float(cfg.get("avgdist_axis_tolerance", 0.05))
     moment2_tolerance = float(cfg.get("moment2_tolerance", 0.02))
     moment3_tolerance = float(cfg.get("moment3_tolerance", 0.01))
+    # off-diagonal terms are raw covariance/mixed-skew (much smaller natural scale
+    # than the sqrt'd diagonal terms) — default to the diag tolerance for
+    # backward compatibility, but override per-experiment to actually engage them
+    moment2_offdiag_tolerance = float(cfg.get("moment2_offdiag_tolerance", moment2_tolerance))
+    moment3_offdiag_tolerance = float(cfg.get("moment3_offdiag_tolerance", moment3_tolerance))
     moment_inv_J1_tolerance = float(cfg.get("moment_inv_J1_tolerance", 0.01))
     moment_inv_J2_tolerance = float(cfg.get("moment_inv_J2_tolerance", 1e-3))
     moment_inv_J3_tolerance = float(cfg.get("moment_inv_J3_tolerance", 1e-4))
@@ -717,15 +726,18 @@ def main(cfg_path: str):
     t0_all = time.time()
 
     for epoch in range(1, epochs + 1):
-        # linear warmup for moment3
+        # linear warmup for moment3 (same ramp applied to diag and off-diag weights)
         if moment3_warmup_end > moment3_warmup_start and epoch <= moment3_warmup_end:
             if epoch <= moment3_warmup_start:
                 lambda_moment3_eff = 0.0
+                lambda_moment3_offdiag_eff = 0.0
             else:
                 progress = (epoch - moment3_warmup_start) / (moment3_warmup_end - moment3_warmup_start)
                 lambda_moment3_eff = progress * lambda_moment3
+                lambda_moment3_offdiag_eff = progress * lambda_moment3_offdiag
         else:
             lambda_moment3_eff = lambda_moment3
+            lambda_moment3_offdiag_eff = lambda_moment3_offdiag
 
         if use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -801,8 +813,10 @@ def main(cfg_path: str):
                 avgdist_loss = logits.new_tensor(0.0)
                 avgdist_axis_loss = logits.new_tensor(0.0)
                 avgdist_axis_stats = logits.new_zeros(3)
-                moment2_loss = logits.new_tensor(0.0)
-                moment3_loss = logits.new_tensor(0.0)
+                moment2_diag_loss = logits.new_tensor(0.0)
+                moment2_offdiag_loss = logits.new_tensor(0.0)
+                moment3_diag_loss = logits.new_tensor(0.0)
+                moment3_offdiag_loss = logits.new_tensor(0.0)
                 moment_inv_loss = logits.new_tensor(0.0)
                 moment2_err = logits.new_tensor(0.0)
                 moment3_err = logits.new_tensor(0.0)
@@ -877,46 +891,52 @@ def main(cfg_path: str):
                             else logits.new_zeros(3)
                         )
 
-                    if lambda_moment2 > 0.0 and len(moment2_classes) > 0:
-                        m2s, m2_errs_per_class = [], {}
+                    if (lambda_moment2 > 0.0 or lambda_moment2_offdiag > 0.0) and len(moment2_classes) > 0:
+                        m2_diags, m2_offdiags, m2_errs_per_class = [], [], {}
                         for c in moment2_classes:
-                            l_c, e_c = compute_2nd_moment_barrier(
+                            diag_c, offdiag_c, e_c = compute_2nd_moment_barrier(
                                 logits=logits,
                                 target=lbl_rs,
                                 n_classes=cfg["n_classes"],
                                 moment_class=c,
                                 barrier=barrier,
                                 moment_tolerance=moment2_tolerance,
+                                offdiag_tolerance=moment2_offdiag_tolerance,
                                 centroid_norm=centroid_norm,
                                 return_stats=True,
                                 gamma=moment2_gamma,
                                 sqrt_diagonal=moment2_sqrt_diagonal,
                                 verbose=moment_verbose,
                             )
-                            m2s.append(l_c)
+                            m2_diags.append(diag_c)
+                            m2_offdiags.append(offdiag_c)
                             m2_errs_per_class[c] = e_c
-                        moment2_loss = torch.stack(m2s).mean() if m2s else logits.new_tensor(0.0)
+                        moment2_diag_loss = torch.stack(m2_diags).mean() if m2_diags else logits.new_tensor(0.0)
+                        moment2_offdiag_loss = torch.stack(m2_offdiags).mean() if m2_offdiags else logits.new_tensor(0.0)
                         moment2_err  = torch.stack(list(m2_errs_per_class.values())).mean() if m2_errs_per_class else logits.new_tensor(0.0)
 
                     if len(moment3_classes) > 0:
-                        m3s, m3_errs_per_class = [], {}
+                        m3_diags, m3_offdiags, m3_errs_per_class = [], [], {}
                         for c in moment3_classes:
-                            l_c, e_c = compute_3rd_moment_barrier(
+                            diag_c, offdiag_c, e_c = compute_3rd_moment_barrier(
                                 logits=logits,
                                 target=lbl_rs,
                                 n_classes=cfg["n_classes"],
                                 moment_class=c,
                                 barrier=barrier,
                                 moment_tolerance=moment3_tolerance,
+                                offdiag_tolerance=moment3_offdiag_tolerance,
                                 centroid_norm=centroid_norm,
                                 return_stats=True,
                                 gamma=moment3_gamma,
                                 sqrt_diagonal=moment3_sqrt_diagonal,
                                 verbose=moment_verbose,
                             )
-                            m3s.append(l_c)
+                            m3_diags.append(diag_c)
+                            m3_offdiags.append(offdiag_c)
                             m3_errs_per_class[c] = e_c
-                        moment3_loss = torch.stack(m3s).mean() if m3s else logits.new_tensor(0.0)
+                        moment3_diag_loss = torch.stack(m3_diags).mean() if m3_diags else logits.new_tensor(0.0)
+                        moment3_offdiag_loss = torch.stack(m3_offdiags).mean() if m3_offdiags else logits.new_tensor(0.0)
                         moment3_err  = torch.stack(list(m3_errs_per_class.values())).mean() if m3_errs_per_class else logits.new_tensor(0.0)
 
                     _any_inv_active = any(l > 0.0 for l in [lambda_moment_inv_J1, lambda_moment_inv_J2, lambda_moment_inv_J3])
@@ -953,8 +973,10 @@ def main(cfg_path: str):
                     + lambda_centroid * cent_loss
                     + lambda_avgdist * avgdist_loss
                     + lambda_avgdist_axis * avgdist_axis_loss
-                    + lambda_moment2 * moment2_loss
-                    + lambda_moment3_eff * moment3_loss
+                    + lambda_moment2 * moment2_diag_loss
+                    + lambda_moment2_offdiag * moment2_offdiag_loss
+                    + lambda_moment3_eff * moment3_diag_loss
+                    + lambda_moment3_offdiag_eff * moment3_offdiag_loss
                     + moment_inv_loss
                 )
 
@@ -977,8 +999,8 @@ def main(cfg_path: str):
             avgdist_axis_z_v = float(avgdist_axis_stats[0].detach())
             avgdist_axis_y_v = float(avgdist_axis_stats[1].detach())
             avgdist_axis_x_v = float(avgdist_axis_stats[2].detach())
-            moment2_loss_v    = float(moment2_loss.detach())
-            moment3_loss_v    = float(moment3_loss.detach())
+            moment2_loss_v    = float((moment2_diag_loss + moment2_offdiag_loss).detach())
+            moment3_loss_v    = float((moment3_diag_loss + moment3_offdiag_loss).detach())
             moment_inv_loss_v = float(moment_inv_loss.detach())
             moment2_err_v     = float(moment2_err.detach())
             moment3_err_v     = float(moment3_err.detach())
@@ -1039,8 +1061,10 @@ def main(cfg_path: str):
             del avgdist_loss
             del avgdist_axis_loss
             del avgdist_axis_stats
-            del moment2_loss
-            del moment3_loss
+            del moment2_diag_loss
+            del moment2_offdiag_loss
+            del moment3_diag_loss
+            del moment3_offdiag_loss
             del moment_inv_loss
             del moment2_err
             del moment3_err

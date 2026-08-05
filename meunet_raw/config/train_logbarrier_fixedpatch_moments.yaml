@@ -36,7 +36,7 @@ lr: 0.0009
 weight_decay: 1.0e-05
 amp: true
 
-epochs: 50
+epochs: 250
 early_stop_patience: 100
 min_lr: 1.0e-06
 deep_supervision_weight: 0.5
@@ -69,11 +69,20 @@ volume_tolerance: 0.10
 centroid_tolerance: 0.05
 avgdist_tolerance: 0.05
 avgdist_axis_tolerance: 0.05
-lambda_moment2: 1.0      # 6 covariance components
-lambda_moment3: 0.21       # 10 skewness components, target weight once fully warmed up
+lambda_moment2: 1.0      # 6 covariance components (diagonal/sigma part)
+lambda_moment3: 0.21       # 10 skewness components, target weight once fully warmed up (diagonal/skew part)
 moment3_warmup_start: 100     # starts warming up at epoch 100
 moment3_warmup_end: 200       # fully at 0.05 by epoch 200
 #lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
+
+# off-diagonal (cross-covariance / mixed-skew) terms — separate weight+tolerance
+# since their natural scale is ~10-100x smaller than the diagonal terms; with a
+# shared tolerance they sat inside the band from epoch 1 and never engaged.
+# Same moment3 warmup ramp applies to lambda_moment3_offdiag.
+lambda_moment2_offdiag: 0.5
+lambda_moment3_offdiag: 0.5
+moment2_offdiag_tolerance: 0.005
+moment3_offdiag_tolerance: 0.0005
 
 moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
 moment2_tolerance: 0.05
@@ -89,5 +98,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: 50_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_0.10xmoment2_tolMoment20.10_1xmoment3_tolMoment30.01
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/50epochs_Moments2and3_gamma1_biggerM2
+wandb_run_name: 250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xmoment2_tolMoment20.10_1xmoment3_tolMoment30.01x0.5offDiag
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_Moments2and3_gamma1_offDiagSeparate
