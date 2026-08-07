@@ -90,5 +90,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: 250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xavg_dist_axis_tolavgdistaxis0.05
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250_epochs_center_volume_avgdist_axis
+wandb_run_name: 250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xavg_dist_axis_tolavgdistaxis0.05_oneGpu
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250_epochs_center_volume_avgdist_axis_oneGPU
