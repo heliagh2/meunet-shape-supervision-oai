@@ -230,17 +230,21 @@ def compute_volume_barrier(
     one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
     one_hot = one_hot.to(device) * valid
 
-    dims = (0, 2, 3, 4)
-    pred_mass = probs.sum(dim=dims)       # (C,)
-    gt_mass   = one_hot.sum(dim=dims)     # (C,)
-    tot_mass  = valid.sum(dim=dims) + eps
+    # per-sample (batch dim preserved), matching centroid/avgdist/moment barriers —
+    # pooling across the batch here would let one badly-sized case hide behind
+    # others in the same step, and would make the constraint's precision depend
+    # on batch size instead of being batch-size-invariant
+    dims = (2, 3, 4)
+    pred_mass = probs.sum(dim=dims)       # (B,C)
+    gt_mass   = one_hot.sum(dim=dims)     # (B,C)
+    tot_mass  = valid.sum(dim=dims) + eps # (B,1)
 
     pred_frac = pred_mass / tot_mass
     gt_frac   = gt_mass / tot_mass
 
     cls_idx = torch.as_tensor(volume_classes, device=device, dtype=torch.long)
-    pred_sel = pred_frac[cls_idx]
-    gt_sel   = gt_frac[cls_idx]
+    pred_sel = pred_frac[:, cls_idx]
+    gt_sel   = gt_frac[:, cls_idx]
 
     lower = gt_sel * (1.0 - volume_tolerance)
     upper = gt_sel * (1.0 + volume_tolerance)
@@ -248,7 +252,7 @@ def compute_volume_barrier(
     z_upper = pred_sel - upper   # <= 0 wanted
     z_lower = lower - pred_sel   # <= 0 wanted
 
-    return barrier(z_upper) + barrier(z_lower)
+    return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
 
 
 def compute_centroid_barrier(
