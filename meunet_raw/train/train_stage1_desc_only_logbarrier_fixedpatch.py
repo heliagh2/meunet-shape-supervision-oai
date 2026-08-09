@@ -643,9 +643,21 @@ def main(cfg_path: str):
     crit = DiceCELoss(cfg["n_classes"])
 
     base_lr = float(cfg.get("lr", 9e-4))
-    effective_lr = base_lr * (world_size ** 0.5) if use_ddp else base_lr
+    # how to scale LR for the larger effective (gradient-averaged) batch under DDP:
+    #   "sqrt"   (default, backward compatible): base_lr * sqrt(world_size)
+    #   "linear": base_lr * world_size  — matches the effective-batch growth exactly
+    #   "none":   base_lr unchanged regardless of world_size
+    lr_scaling = str(cfg.get("lr_scaling", "sqrt")).lower()
+    if not use_ddp:
+        effective_lr = base_lr
+    elif lr_scaling == "linear":
+        effective_lr = base_lr * world_size
+    elif lr_scaling == "none":
+        effective_lr = base_lr
+    else:
+        effective_lr = base_lr * (world_size ** 0.5)
     if is_main and use_ddp:
-        print(f"LR scaled: {base_lr:.2e} -> {effective_lr:.2e} (sqrt({world_size}) rule)")
+        print(f"LR scaled: {base_lr:.2e} -> {effective_lr:.2e} ({lr_scaling} rule, world_size={world_size})")
 
     opt = torch.optim.Adam(
         model.parameters(),
