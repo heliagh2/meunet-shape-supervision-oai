@@ -688,6 +688,14 @@ def main(cfg_path: str):
 
     # barrier config
     barrier_t = float(cfg.get("barrier_t", 5.0))
+    # per-epoch tightening (Kervadec et al. 1904.04205 style): t <- min(t0 * mu^epoch, t_max).
+    # Scoped to volume/centroid/avgdist/avgdist_axis only — the moment terms (esp.
+    # off-diagonal) already sit deep in the barrier's linear-extension region at
+    # small t given their tiny natural scale, so sharing a growing t with them
+    # would just inflate their (constant, always-active) linear-branch gradient
+    # rather than meaningfully tighten a log-region cutoff they never reach.
+    barrier_t_mu = float(cfg.get("barrier_t_mu", 1.0))     # 1.0 = no growth (backward compatible)
+    barrier_t_max = float(cfg.get("barrier_t_max", 100.0))
     volume_tolerance = float(cfg.get("volume_tolerance", 0.10))
     centroid_tolerance = float(cfg.get("centroid_tolerance", 0.05))
     avgdist_tolerance = float(cfg.get("avgdist_tolerance", 0.05))
@@ -710,7 +718,8 @@ def main(cfg_path: str):
     moment2_gamma = 5/3 if _moment_norm == "fractional" else 1.0
     moment3_gamma = 2.0  if _moment_norm == "fractional" else 1.0
     moment_inv_gamma = 5/3 if _moment_norm == "fractional" else 1.0
-    barrier = LogBarrierLoss(t=barrier_t)
+    barrier = LogBarrierLoss(t=barrier_t)              # static — moment2/moment3/moment_inv
+    barrier_shape = LogBarrierLoss(t=barrier_t)         # scheduled — volume/centroid/avgdist/avgdist_axis
 
     # training mode switches
     use_seg_loss = bool(cfg.get("use_seg_loss", True))
@@ -742,6 +751,10 @@ def main(cfg_path: str):
         else:
             lambda_moment3_eff = lambda_moment3
             lambda_moment3_offdiag_eff = lambda_moment3_offdiag
+
+        # tighten the shape barrier (volume/centroid/avgdist/avgdist_axis) each epoch;
+        # moment2/moment3/moment_inv keep using the static `barrier` at fixed barrier_t
+        barrier_shape.t = min(barrier_t * (barrier_t_mu ** (epoch - 1)), barrier_t_max)
 
         if use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -836,7 +849,7 @@ def main(cfg_path: str):
                             target=lbl_rs,
                             n_classes=cfg["n_classes"],
                             volume_classes=volume_classes,
-                            barrier=barrier,
+                            barrier=barrier_shape,
                             volume_tolerance=volume_tolerance,
                         )
 
@@ -849,7 +862,7 @@ def main(cfg_path: str):
                                     target=lbl_rs,
                                     n_classes=cfg["n_classes"],
                                     centroid_class=c,
-                                    barrier=barrier,
+                                    barrier=barrier_shape,
                                     centroid_tolerance=centroid_tolerance,
                                     centroid_norm=centroid_norm,
                                 )
@@ -865,7 +878,7 @@ def main(cfg_path: str):
                                     target=lbl_rs,
                                     n_classes=cfg["n_classes"],
                                     distance_class=c,
-                                    barrier=barrier,
+                                    barrier=barrier_shape,
                                     avgdist_tolerance=avgdist_tolerance,
                                     centroid_norm=centroid_norm,
                                 )
@@ -881,7 +894,7 @@ def main(cfg_path: str):
                                     target=lbl_rs,
                                     n_classes=cfg["n_classes"],
                                     distance_class=c,
-                                    barrier=barrier,
+                                    barrier=barrier_shape,
                                     avgdist_axis_tolerance=avgdist_axis_tolerance,
                                     centroid_norm=centroid_norm,
                                     return_stats=True,
@@ -1050,7 +1063,7 @@ def main(cfg_path: str):
                     f"m2={moment2_loss_v:.4f}(err={moment2_err_v:.2e}) "
                     f"m3={moment3_loss_v:.4f}(err={moment3_err_v:.2e}) "
                     f"minv={moment_inv_loss_v:.4f}(J1={moment_inv_stats_v[0]:.2e},J2={moment_inv_stats_v[1]:.2e},J3={moment_inv_stats_v[2]:.2e}) "
-                    f"t={barrier_t:.2f} "
+                    f"t_shape={barrier_shape.t:.2f} t_moment={barrier.t:.2f} "
                     f"lr={lr_now(opt):.2e}"
                 )
 
@@ -1198,7 +1211,8 @@ def main(cfg_path: str):
             "lr": lr_now(opt),
             "use_seg_loss": int(use_seg_loss),
             "monitor_seg_loss": int(monitor_seg_loss),
-            "barrier_t": barrier_t,
+            "barrier_t_shape": barrier_shape.t,
+            "barrier_t_moment": barrier.t,
             "volume_tolerance": volume_tolerance,
             "centroid_tolerance": centroid_tolerance,
             "avgdist_tolerance": avgdist_tolerance,
@@ -1263,7 +1277,8 @@ def main(cfg_path: str):
                 # schedule
                 "schedule/lr":              lr_now(opt),
                 "schedule/lambda_m3_eff":   lambda_moment3_eff,
-                "schedule/barrier_t":       barrier_t,
+                "schedule/barrier_t_shape": barrier_shape.t,
+                "schedule/barrier_t_moment": barrier.t,
             }, step=epoch)
 
         # periodic checkpoints (rank 0 only)
