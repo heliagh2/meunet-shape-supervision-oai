@@ -43,6 +43,7 @@ smooth_dice_eps: 1.0e-6
 
 optimizer: adam
 lr: 0.0009
+lr_scaling: linear   # base_lr * world_size instead of the default sqrt(world_size)
 weight_decay: 1.0e-05
 amp: true
 
