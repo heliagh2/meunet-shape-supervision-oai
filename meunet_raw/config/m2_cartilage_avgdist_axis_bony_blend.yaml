@@ -1,0 +1,110 @@
+# === OAI stage-1: descriptor-only gradients for all classes ===
+# both STD & EXP patches, ESP=100, STD patch = [200,200,200], EXP patch=[400,400,400]
+# dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
+#
+# Isolated moment2 x avgdist_axis blend, split by class per the 50-epoch eval table:
+#   classes: 1=femur, 2=femur cartilage, 3=tibia, 4=tibial cartilage
+#   - avgdist_axis on [1, 3]  (bony structures — this is what was already working well
+#     for them; avgdist_axis was weak specifically on the cartilages: 40.3/43.5)
+#   - moment2 on [2, 4]       (cartilages — this is what showed the +8pt gain on
+#     femur cartilage, and roughly held tibial cartilage, in the eval table)
+#   No class overlap between the two terms, so they're not double-driving the same
+#   voxels. moment3 deliberately OFF this run — isolate moment2's effect first.
+#   No barrier_t scheduling yet (t stays fixed at barrier_t, no warmup).
+#   norm: batch, to stay comparable with the existing baseline/clean_50epoch_run
+#   series (instance norm is a separate, still-pending ablation).
+
+# data
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200]
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#Exp toggles
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+desc_only_classes: [1, 2, 3, 4]
+
+volume_classes: [1, 2, 3, 4]      # size still supervised on all four
+centroid_classes: [1, 2, 3, 4]    # position still supervised on all four
+avgdist_axis_classes: [1, 3]      # bony structures: femur, tibia
+moment2_classes: [2, 4]           # cartilages: femur cartilage, tibial cartilage
+moment3_classes: []               # off this run — isolate moment2 first
+avgdist_classes: [1, 2, 3, 4]     # unused (lambda_avgdist: 0.0 below)
+
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 1.0
+lambda_centroid: 5.0
+lambda_avgdist: 0.0              # radial mean distance to centroid barrier — unused
+lambda_avgdist_axis: 1.0         # per-axis spread-to-centroid barrier, classes [1,3] only
+centroid_norm: true              # normalize coords to [0,1]
+
+##logbarrier toggles
+# barrier_t: 5.0   — left at fixed default, no scheduling this run
+volume_tolerance: 0.10
+centroid_tolerance: 0.05
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.05
+
+lambda_moment2: 1.0               # diagonal (sigma) part, classes [2,4] only
+lambda_moment2_offdiag: 0.0       # keep isolated moment2 test simple — no off-diag yet
+moment2_tolerance: 0.05
+moment2_offdiag_tolerance: 0.005  # inactive while lambda_moment2_offdiag=0.0
+moment2_sqrt_diagonal: true       # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+
+lambda_moment3: 0.0                # off this run
+lambda_moment3_offdiag: 0.0        # off this run
+moment3_tolerance: 0.01
+moment3_offdiag_tolerance: 0.0005
+moment3_warmup_start: 100          # irrelevant while lambda_moment3=0.0
+moment3_warmup_end: 200
+
+moment_inv_tolerance: 0.01
+lambda_moment_inv_J1: 0.0
+lambda_moment_inv_J2: 0.0
+lambda_moment_inv_J3: 0.0
+moment_inv_J1_tolerance: 0.01
+moment_inv_J2_tolerance: 5.0e-4
+moment_inv_J3_tolerance: 1.0e-5
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: 250epochs_avgdistaxis_bony1x3_moment2_cartilage2x4_1.0M2_batchnorm_noM3
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_avgdistaxis_bony_moment2_cartilage_blend_batchnorm
