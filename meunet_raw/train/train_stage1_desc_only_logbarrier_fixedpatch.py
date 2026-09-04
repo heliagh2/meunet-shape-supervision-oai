@@ -80,6 +80,51 @@ def resize_lbl_to_logits(lbl: torch.Tensor, logits: torch.Tensor) -> torch.Tenso
     return lbl_rs.long()
 
 
+def select_viz_slice(lbl, cartilage_classes, axis=0, min_pixels=1):
+    """
+    Pick the slice along `axis` that best shows the given (small) cartilage
+    classes: maximize the smallest per-class pixel count among them, so both
+    classes are visible rather than just the larger one. Falls back to their
+    summed pixel count if no slice has >= min_pixels for every class.
+    lbl: (D,H,W) int array.
+    """
+    lbl = np.asarray(lbl)
+    n_slices = lbl.shape[axis]
+    counts = np.zeros((n_slices, len(cartilage_classes)), dtype=np.int64)
+    for i in range(n_slices):
+        sl = np.take(lbl, i, axis=axis)
+        for j, c in enumerate(cartilage_classes):
+            counts[i, j] = int((sl == c).sum())
+    min_counts = counts.min(axis=1)
+    best = int(min_counts.argmax())
+    if min_counts[best] < min_pixels:
+        best = int(counts.sum(axis=1).argmax())
+    return best
+
+
+def build_viz_wandb_image(img_slice, gt_slice, pred_slice, class_names):
+    """
+    img_slice: (H,W) float array, min-max normalized for display.
+    gt_slice, pred_slice: (H,W) int arrays of class indices.
+    """
+    img = np.asarray(img_slice, dtype=np.float32)
+    lo, hi = float(img.min()), float(img.max())
+    img = (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
+    return wandb.Image(
+        img,
+        masks={
+            "prediction": {
+                "mask_data": np.asarray(pred_slice, dtype=np.uint8),
+                "class_labels": class_names,
+            },
+            "ground_truth": {
+                "mask_data": np.asarray(gt_slice, dtype=np.uint8),
+                "class_labels": class_names,
+            },
+        },
+    )
+
+
 def one_hot_labels(target, n_classes, ignore_index=-1):
     """
     target: (B,Z,Y,X) int with possible -1
@@ -604,11 +649,12 @@ def main(cfg_path: str):
     if is_main:
         print(f"Fold {fold}: train={len(tr_stems)} val={len(va_stems)}")
 
+    expand_factor = float(cfg.get("expand_factor", 1.25))
+    fg_prob = float(cfg.get("fg_sampling_prob", 0.5))
+
     if use_ddp:
         # Build datasets up front to pass to DistributedSampler
         from data.dataset_oai_raw_fixedpatch import OAIPairedPatch
-        expand_factor = float(cfg.get("expand_factor", 1.25))
-        fg_prob = float(cfg.get("fg_sampling_prob", 0.5))
         tr_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], tr_stems,
                                cfg["patch_size"], expand_factor, fg_prob, True)
         va_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], va_stems,
@@ -749,6 +795,51 @@ def main(cfg_path: str):
     csv_path = workdir / "progress.csv"
     rows = []
     t0_all = time.time()
+
+    # --- fixed validation-sample visualization (wandb) ---
+    # Tracks one val patient's segmentation over training so shape evolution
+    # (esp. the small cartilage classes) can be inspected visually alongside
+    # the scalar moment metrics. Rank 0 only: it independently indexes into
+    # its own copy of the val split and runs a lone forward pass on the fixed
+    # patch, so no cross-rank communication is needed — the val DistributedSampler
+    # loop is untouched.
+    viz_enable = bool(cfg.get("viz_enable", False))
+    viz_every_n_epochs = int(cfg.get("viz_every_n_epochs", 10))
+    viz_patient_stem = cfg.get("viz_patient_stem", None)  # None -> va_stems[0]
+    viz_cartilage_classes = as_int_list(cfg.get("viz_cartilage_classes", moment2_classes), default=moment2_classes)
+    viz_min_cartilage_pixels = int(cfg.get("viz_min_cartilage_pixels", 1))
+    viz_slice_axis = int(cfg.get("viz_slice_axis", 0))
+    viz_class_names = {int(k): v for k, v in cfg.get("viz_class_names", {
+        0: "background", 1: "femur", 2: "femoral_cartilage", 3: "tibia", 4: "tibial_cartilage",
+    }).items()}
+
+    viz_ready = False
+    viz_sample = None
+    viz_slice_idx = None
+    if viz_enable and is_main:
+        if not (use_wandb and WANDB_AVAILABLE):
+            print("Warning: viz_enable=True but wandb logging is not active — disabling viz.")
+            viz_enable = False
+        else:
+            viz_stem = viz_patient_stem if viz_patient_stem is not None else va_stems[0]
+            if viz_stem not in va_stems:
+                print(f"Warning: viz_patient_stem={viz_stem!r} not found in val split — disabling viz.")
+                viz_enable = False
+            else:
+                from data.dataset_oai_raw_fixedpatch import OAIPairedPatch as _OAIPairedPatchViz
+                viz_ds = _OAIPairedPatchViz(
+                    cfg["images_dir"], cfg["labels_dir"], [viz_stem],
+                    cfg["patch_size"], expand_factor, fg_prob, False,
+                )
+                viz_sample = viz_ds[0]
+                viz_slice_idx = select_viz_slice(
+                    viz_sample["std_lbl"].numpy(),
+                    cartilage_classes=viz_cartilage_classes,
+                    axis=viz_slice_axis,
+                    min_pixels=viz_min_cartilage_pixels,
+                )
+                viz_ready = True
+                print(f"[viz] Tracking patient={viz_stem} slice={viz_slice_idx} (axis={viz_slice_axis})")
 
     for epoch in range(1, epochs + 1):
         # linear warmup for moment3 (same ramp applied to diag and off-diag weights)
@@ -1246,6 +1337,28 @@ def main(cfg_path: str):
             rows.append(row)
             pd.DataFrame(rows).to_csv(csv_path, index=False)
 
+        viz_log = {}
+        if viz_enable and viz_ready and is_main and (epoch % viz_every_n_epochs == 0):
+            raw_model = model.module if use_ddp else model
+            raw_model.eval()
+            with torch.no_grad():
+                x = viz_sample["std_img"].unsqueeze(0).to(device)
+                out = raw_model(x, expanded=False)
+                # upsample the prediction back to the original patch resolution
+                # (rather than downsizing GT) so viz_slice_idx, picked once
+                # against std_lbl, stays valid across epochs.
+                pred_full = F.interpolate(
+                    out["logit1"].argmax(dim=1, keepdim=True).float(),
+                    size=viz_sample["std_img"].shape[-3:],
+                    mode="nearest",
+                )[0, 0].long().cpu().numpy()
+            img_slice = np.take(viz_sample["std_img"][0].numpy(), viz_slice_idx, axis=viz_slice_axis)
+            gt_slice = np.take(viz_sample["std_lbl"].numpy(), viz_slice_idx, axis=viz_slice_axis)
+            pred_slice = np.take(pred_full, viz_slice_idx, axis=viz_slice_axis)
+            viz_log = {
+                "viz/segmentation": build_viz_wandb_image(img_slice, gt_slice, pred_slice, viz_class_names)
+            }
+
         if use_wandb and is_main:
             wandb.log({
                 # total and seg monitoring
@@ -1291,6 +1404,7 @@ def main(cfg_path: str):
                 "schedule/lambda_m3_eff":   lambda_moment3_eff,
                 "schedule/barrier_t_shape": barrier_shape.t,
                 "schedule/barrier_t_moment": barrier.t,
+                **viz_log,
             }, step=epoch)
 
         # periodic checkpoints (rank 0 only)
