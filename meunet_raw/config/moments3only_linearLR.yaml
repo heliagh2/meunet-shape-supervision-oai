@@ -96,7 +96,7 @@ moment3_warmup_end: 200       # fully at 0.05 by epoch 200
 
 # off-diagonal (cross-covariance / mixed-skew) terms — tightened from the previous
 # run's values based on observed error magnitudes (see header note)
-lambda_moment2_offdiag: 0.0s
+lambda_moment2_offdiag: 0.0
 lambda_moment3_offdiag: 0.5
 moment2_offdiag_tolerance: 0.0015
 moment3_offdiag_tolerance: 0.00015
