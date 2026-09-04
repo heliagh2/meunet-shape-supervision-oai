@@ -24,6 +24,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches
 
 try:
     import wandb
@@ -102,27 +103,64 @@ def select_viz_slice(lbl, cartilage_classes, axis=0, min_pixels=1):
     return best
 
 
+_VIZ_CLASS_COLORS = {
+    1: (0.20, 0.45, 1.00),  # femur
+    2: (0.20, 0.85, 0.30),  # femoral cartilage
+    3: (1.00, 0.55, 0.10),  # tibia
+    4: (1.00, 0.90, 0.10),  # tibial cartilage
+}
+
+
+def _draw_mask_overlay(ax, img, mask, class_names, alpha=0.45):
+    ax.imshow(img, cmap="gray", vmin=0, vmax=1)
+    rgba = np.zeros((*mask.shape, 4), dtype=np.float32)
+    for c, color in _VIZ_CLASS_COLORS.items():
+        if c not in class_names:
+            continue
+        m = mask == c
+        rgba[m, 0:3] = color
+        rgba[m, 3] = alpha
+    ax.imshow(rgba)
+    ax.set_axis_off()
+
+
 def build_viz_wandb_image(img_slice, gt_slice, pred_slice, class_names):
     """
+    Builds a self-contained 3-panel PNG (scan | GT overlay | prediction
+    overlay) with the overlay baked into the pixels, so it downloads/screenshots
+    correctly (unlike wandb's client-side-rendered `masks=` overlay, which
+    only bakes the underlying scan into the exported image).
     img_slice: (H,W) float array, min-max normalized for display.
     gt_slice, pred_slice: (H,W) int arrays of class indices.
     """
     img = np.asarray(img_slice, dtype=np.float32)
     lo, hi = float(img.min()), float(img.max())
     img = (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
-    return wandb.Image(
-        img,
-        masks={
-            "prediction": {
-                "mask_data": np.asarray(pred_slice, dtype=np.uint8),
-                "class_labels": class_names,
-            },
-            "ground_truth": {
-                "mask_data": np.asarray(gt_slice, dtype=np.uint8),
-                "class_labels": class_names,
-            },
-        },
-    )
+    gt_slice = np.asarray(gt_slice)
+    pred_slice = np.asarray(pred_slice)
+
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3.4), dpi=120)
+    axes[0].imshow(img, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("scan", fontsize=9)
+    axes[0].set_axis_off()
+    _draw_mask_overlay(axes[1], img, gt_slice, class_names)
+    axes[1].set_title("ground truth", fontsize=9)
+    _draw_mask_overlay(axes[2], img, pred_slice, class_names)
+    axes[2].set_title("prediction", fontsize=9)
+
+    handles = [
+        matplotlib.patches.Patch(color=color, label=class_names.get(c, str(c)))
+        for c, color in _VIZ_CLASS_COLORS.items()
+        if c in class_names
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    out = rgba[..., :3].copy()
+    plt.close(fig)
+    return wandb.Image(out)
 
 
 def one_hot_labels(target, n_classes, ignore_index=-1):
