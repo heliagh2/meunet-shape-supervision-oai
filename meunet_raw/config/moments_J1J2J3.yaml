@@ -58,6 +58,10 @@ lambda_avgdist: 0.0             # radial mean distance to centroid barrier
 lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
 ##logbarrier toggles
 # barrier_t: 5.0   — static, no schedule this run (kept isolated from the barrier_t ablation)
 volume_tolerance: 0.10
