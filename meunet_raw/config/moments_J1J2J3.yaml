@@ -91,5 +91,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: 250epochs_moment2and3_allclasses_batchnorm_linearLR_retunedTol
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_moments2and3_batchnorm_linearLR_retunedTol
+wandb_run_name: 250epochs_moment2using_J1J2J3only
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_J1J2J3only
