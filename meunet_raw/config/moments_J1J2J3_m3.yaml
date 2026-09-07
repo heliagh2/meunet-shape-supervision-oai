@@ -1,0 +1,131 @@
+# data
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200]
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+lr_scaling: linear   # base_lr * world_size instead of the default sqrt(world_size)
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#Exp toggles
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all classes
+desc_only_classes: [1, 2, 3, 4]
+centroid_classes: [1, 2, 3, 4]
+volume_classes: [1, 2, 3, 4]
+avgdist_classes: [1, 2, 3, 4]
+avgdist_axis_classes: [1, 2, 3, 4]
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 1.0
+lambda_centroid: 5.0
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
+centroid_norm: true             # normalize coords to [0,1]
+
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
+##logbarrier toggles
+# barrier_t: 5.0   — static, no schedule this run (kept isolated from the barrier_t ablation)
+volume_tolerance: 0.10
+centroid_tolerance: 0.05
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.05
+lambda_moment2: 0.0     # 6 covariance components (diagonal/sigma part)
+lambda_moment3: 0.21       # 10 skewness components, target weight once fully warmed up (diagonal/skew part)
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
+#lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
+
+# off-diagonal (cross-covariance / mixed-skew) terms — tightened from the previous
+# run's values based on observed error magnitudes (see header note)
+lambda_moment2_offdiag: 0.0
+lambda_moment3_offdiag: 0.5
+moment2_offdiag_tolerance: 0.0015
+moment3_offdiag_tolerance: 0.00015
+
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 0.05
+moment3_tolerance: 0.015  # loosened from 0.01 — see header note on class 4
+moment_inv_tolerance: 0.01
+
+lambda_moment_inv_J1: 1.0
+lambda_moment_inv_J2: 1.0
+lambda_moment_inv_J3: 1.0
+
+# Tolerances retuned from the measured error trajectory of the previous run
+# (see below). The old values (1e-2 / 5e-4 / 1e-5) were already satisfied by
+# epoch 64 at meanFGDice=0.5855 — err/tol was 79% / 74% / 41% — so the
+# constraints went slack exactly where the segmentation was still mediocre.
+# Assuming an isotropic spread sigma ~ 0.2 in normalized coords (the value that
+# makes all three relative errors agree at ~6-7%, across quantities spanning
+# sigma^2 to sigma^6), the old tolerances were ~8% / 10% / 16% relative.
+# These tighten that to ~3-4% relative so the barrier keeps biting through the
+# Dice 0.7-0.9 range. The [minv class=N J*] verbose lines print the measured GT
+# magnitude and relative error every 10 epochs — use them to re-check sigma.
+moment_inv_J1_tolerance: 4.0e-3
+moment_inv_J2_tolerance: 2.0e-4
+moment_inv_J3_tolerance: 2.5e-6
+
+# --- barrier sharpness for the moment family (moment2 / moment3 / J1-J2-J3) ---
+# LogBarrierLoss switches from its log branch to a linear extension at |z| = 1/t^2.
+# With the legacy shared barrier_t=5 that switch sits at 0.04 — larger than every
+# moment tolerance here — which made the log branch unreachable AND made the upper
+# and lower linear branches (slopes +t and -t) cancel exactly, giving a
+# zero-gradient dead zone of half-width (1/t^2 - tol) around the target. Every
+# moment term was therefore contributing no gradient at all in previous runs.
+#
+# "auto" derives a separate t per term from that term's own tolerance:
+#     1/t^2 = moment_barrier_margin_frac * tol   ->   t = 1/sqrt(margin_frac * tol)
+# Resulting t with the tolerances above: J1=50, J2=224, J3=2000,
+# m3_diag=25.8, m3_offdiag=258. Set to "static" to reproduce the old t=5 behaviour.
+# Individual overrides, if ever needed: moment_barrier_t_J1 / _J2 / _J3 /
+# _m2_diag / _m2_offdiag / _m3_diag / _m3_offdiag (an explicit value wins over the formula).
+moment_barrier_t_mode: auto
+moment_barrier_margin_frac: 0.1
+moment_barrier_t_max: 1.0e4
+# NOTE: barrier_t / barrier_t_mu / barrier_t_max are untouched and still apply
+# only to volume / centroid / avgdist / avgdist_axis, so those stay comparable
+# to earlier runs. barrier_t_mu is unset -> 1.0 -> no per-epoch growth.
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: 250epochs_moment2using_J1J2J3_m3
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_J1J2J3_m3
