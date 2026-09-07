@@ -124,6 +124,7 @@ def compute_2nd_moment_barrier(
     gamma=1.0,
     sqrt_diagonal=True,
     verbose=False,
+    barrier_offdiag=None,
 ):
     """
     Log-barrier on the 6 normalized 2nd-order central moments.
@@ -148,6 +149,8 @@ def compute_2nd_moment_barrier(
     """
     if offdiag_tolerance is None:
         offdiag_tolerance = moment_tolerance
+    if barrier_offdiag is None:
+        barrier_offdiag = barrier
 
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -194,7 +197,7 @@ def compute_2nd_moment_barrier(
             if verbose:
                 (diag_errors if is_diag else offdiag_errors).append(float(err.detach()))
         tol = moment_tolerance if is_diag else offdiag_tolerance
-        term_loss = _barrier_pair(barrier, pred_m, gt_m, tol)
+        term_loss = _barrier_pair(barrier if is_diag else barrier_offdiag, pred_m, gt_m, tol)
         if is_diag:
             diag_loss = diag_loss + term_loss
         else:
@@ -231,6 +234,10 @@ def compute_moment_invariants_barrier(
     eps=1e-6,
     return_stats=False,
     gamma=1.0,
+    barrier_J1=None,
+    barrier_J2=None,
+    barrier_J3=None,
+    verbose=False,
 ):
     """
     Log-barrier on the three rotation-invariant scalars derived from the
@@ -246,7 +253,21 @@ def compute_moment_invariants_barrier(
 
     gamma: normalization order (1.0 = weighted average, 5/3 = fractional mass).
     return_stats: if True, returns (loss, stats) where stats is a tensor [err_J1, err_J2, err_J3].
+
+    barrier_J1/J2/J3: optional per-invariant LogBarrierLoss instances. J1, J2 and J3
+      live on wildly different scales (sigma^2 / sigma^4 / sigma^6), so a single
+      shared `t` cannot suit all three: the log/linear switch sits at |z| = 1/t^2,
+      and whenever 1/t^2 > tol the log branch becomes unreachable and the upper and
+      lower linear branches cancel (slope +t and -t), leaving an exactly-zero-gradient
+      dead zone around the target. Passing a per-invariant barrier whose t satisfies
+      1/t^2 << tol keeps each constraint in its log region. Falls back to `barrier`.
+
+    verbose: print per-class predicted/GT invariant magnitudes and relative errors,
+      so tolerances can be calibrated against measured scale rather than guessed.
     """
+    barrier_J1 = barrier_J1 if barrier_J1 is not None else barrier
+    barrier_J2 = barrier_J2 if barrier_J2 is not None else barrier
+    barrier_J3 = barrier_J3 if barrier_J3 is not None else barrier
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
         logits, target, n_classes, moment_class, ignore_index, eps, centroid_norm
@@ -283,17 +304,28 @@ def compute_moment_invariants_barrier(
 
     loss = logits_ref.new_tensor(0.0)
     inv_terms = [
-        (lambda_J1, tol_J1, pJ1, gJ1),
-        (lambda_J2, tol_J2, pJ2, gJ2),
-        (lambda_J3, tol_J3, pJ3, gJ3),
+        ("J1", lambda_J1, tol_J1, barrier_J1, pJ1, gJ1),
+        ("J2", lambda_J2, tol_J2, barrier_J2, pJ2, gJ2),
+        ("J3", lambda_J3, tol_J3, barrier_J3, pJ3, gJ3),
     ]
     errors = []
-    for lam, tol, pj, gj in inv_terms:
+    for name, lam, tol, bar, pj, gj in inv_terms:
         pj_valid, gj_valid = pj[has_class], gj[has_class]
         if lam > 0.0:
-            loss = loss + lam * _barrier_pair(barrier, pj_valid, gj_valid, tol)
-        if return_stats:
-            errors.append((pj_valid - gj_valid).abs().mean())
+            loss = loss + lam * _barrier_pair(bar, pj_valid, gj_valid, tol)
+        if return_stats or verbose:
+            err = (pj_valid - gj_valid).abs().mean()
+            errors.append(err)
+            if verbose:
+                gt_mag = gj_valid.abs().mean()
+                rel = float(err.detach()) / max(float(gt_mag.detach()), eps)
+                rel_tol = tol / max(float(gt_mag.detach()), eps)
+                print(
+                    f"        [minv class={moment_class} {name}] "
+                    f"gt={float(gt_mag.detach()):.3e} err={float(err.detach()):.3e} "
+                    f"rel_err={rel*100:.2f}% tol={tol:.1e} (rel_tol={rel_tol*100:.2f}%) "
+                    f"t={bar.t:.1f} {'VIOLATED' if float(err.detach()) > tol else 'satisfied'}"
+                )
 
     if return_stats:
         stats = torch.stack(errors) if errors else logits_ref.new_zeros(3)
@@ -318,6 +350,7 @@ def compute_3rd_moment_barrier(
     gamma=1.0,
     sqrt_diagonal=True,
     verbose=False,
+    barrier_offdiag=None,
 ):
     """
     Log-barrier on all 10 normalized 3rd-order central moments.
@@ -341,6 +374,8 @@ def compute_3rd_moment_barrier(
     """
     if offdiag_tolerance is None:
         offdiag_tolerance = moment_tolerance
+    if barrier_offdiag is None:
+        barrier_offdiag = barrier
 
     logits_ref = logits
     pred_w, gt_mask, coords, pred_sum, gt_sum, pred_c, gt_c, has_class = _setup(
@@ -395,7 +430,7 @@ def compute_3rd_moment_barrier(
             if verbose:
                 (diag_errors if is_pure_cubic else offdiag_errors).append(float(err.detach()))
         tol = moment_tolerance if is_pure_cubic else offdiag_tolerance
-        term_loss = _barrier_pair(barrier, pred_m, gt_m, tol)
+        term_loss = _barrier_pair(barrier if is_pure_cubic else barrier_offdiag, pred_m, gt_m, tol)
         if is_pure_cubic:
             diag_loss = diag_loss + term_loss
         else:

@@ -8,6 +8,7 @@ REPO_ROOT = THIS_DIR.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import json
+import math
 import os
 import time
 import random
@@ -814,8 +815,69 @@ def main(cfg_path: str):
     moment2_gamma = 5/3 if _moment_norm == "fractional" else 1.0
     moment3_gamma = 2.0  if _moment_norm == "fractional" else 1.0
     moment_inv_gamma = 5/3 if _moment_norm == "fractional" else 1.0
-    barrier = LogBarrierLoss(t=barrier_t)              # static — moment2/moment3/moment_inv
+    barrier = LogBarrierLoss(t=barrier_t)              # static — legacy fallback for moment terms
     barrier_shape = LogBarrierLoss(t=barrier_t)         # scheduled — volume/centroid/avgdist/avgdist_axis
+
+    # ---- per-term barrier sharpness for the moment family -------------------
+    # The log/linear switch of LogBarrierLoss sits at |z| = 1/t^2. When 1/t^2 > tol
+    # the log branch is unreachable, and the upper/lower linear branches (slopes +t
+    # and -t) cancel exactly, leaving a zero-gradient dead zone of half-width
+    # (1/t^2 - tol) around the target. With the legacy shared t=5 that dead zone is
+    # ~0.04 wide, which swallows every moment-scale quantity here (tolerances 5e-2
+    # down to 1e-5), so those terms contributed no gradient at all.
+    #
+    # "auto" sizes each term's t from its own tolerance so 1/t^2 = margin_frac * tol,
+    # keeping the switch a fixed fraction inside the band. Scoped to moment2/moment3/
+    # moment_inv only: volume/centroid/avgdist keep barrier_shape at barrier_t so the
+    # descriptor ablations stay comparable to earlier runs.
+    moment_barrier_t_mode = str(cfg.get("moment_barrier_t_mode", "auto")).lower()
+    moment_barrier_margin_frac = float(cfg.get("moment_barrier_margin_frac", 0.1))
+    moment_barrier_t_max = float(cfg.get("moment_barrier_t_max", 1.0e4))
+
+    def _moment_barrier(name, tol):
+        """Barrier for one moment term; explicit override > formula > legacy static."""
+        override = cfg.get(f"moment_barrier_t_{name}", None)
+        if override is not None:
+            return LogBarrierLoss(t=float(override))
+        if moment_barrier_t_mode != "auto":
+            return barrier
+        if tol is None or tol <= 0.0:
+            return barrier
+        t_auto = min(1.0 / math.sqrt(moment_barrier_margin_frac * tol), moment_barrier_t_max)
+        return LogBarrierLoss(t=t_auto)
+
+    barrier_m2_diag    = _moment_barrier("m2_diag",    moment2_tolerance)
+    barrier_m2_offdiag = _moment_barrier("m2_offdiag", moment2_offdiag_tolerance)
+    barrier_m3_diag    = _moment_barrier("m3_diag",    moment3_tolerance)
+    barrier_m3_offdiag = _moment_barrier("m3_offdiag", moment3_offdiag_tolerance)
+    barrier_J1         = _moment_barrier("J1",         moment_inv_J1_tolerance)
+    barrier_J2         = _moment_barrier("J2",         moment_inv_J2_tolerance)
+    barrier_J3         = _moment_barrier("J3",         moment_inv_J3_tolerance)
+
+    _moment_barrier_ts = {
+        "m2_diag": barrier_m2_diag.t, "m2_offdiag": barrier_m2_offdiag.t,
+        "m3_diag": barrier_m3_diag.t, "m3_offdiag": barrier_m3_offdiag.t,
+        "J1": barrier_J1.t, "J2": barrier_J2.t, "J3": barrier_J3.t,
+    }
+    _moment_barrier_tols = {
+        "m2_diag": moment2_tolerance, "m2_offdiag": moment2_offdiag_tolerance,
+        "m3_diag": moment3_tolerance, "m3_offdiag": moment3_offdiag_tolerance,
+        "J1": moment_inv_J1_tolerance, "J2": moment_inv_J2_tolerance,
+        "J3": moment_inv_J3_tolerance,
+    }
+
+    if is_main:
+        print(f"[barrier] shape terms (vol/cent/avgdist): t={barrier_t:.2f} "
+              f"mu={barrier_t_mu:.3f} t_max={barrier_t_max:.1f} "
+              f"({'scheduled' if barrier_t_mu > 1.0 else 'static'}) — unchanged")
+        print(f"[barrier] moment terms: mode={moment_barrier_t_mode} "
+              f"margin_frac={moment_barrier_margin_frac}")
+        for _n, _t in _moment_barrier_ts.items():
+            _tol = _moment_barrier_tols[_n]
+            _dead = (1.0 / _t ** 2) - _tol
+            print(f"           {_n:11s} tol={_tol:.2e}  t={_t:8.2f}  "
+                  f"1/t^2={1.0/_t**2:.2e}  "
+                  f"{'DEAD ZONE +/-%.2e' % _dead if _dead > 0 else 'ok (log region reachable)'}")
 
     # training mode switches
     use_seg_loss = bool(cfg.get("use_seg_loss", True))
@@ -1057,7 +1119,8 @@ def main(cfg_path: str):
                                 target=lbl_rs,
                                 n_classes=cfg["n_classes"],
                                 moment_class=c,
-                                barrier=barrier,
+                                barrier=barrier_m2_diag,
+                                barrier_offdiag=barrier_m2_offdiag,
                                 moment_tolerance=moment2_tolerance,
                                 offdiag_tolerance=moment2_offdiag_tolerance,
                                 centroid_norm=centroid_norm,
@@ -1081,7 +1144,8 @@ def main(cfg_path: str):
                                 target=lbl_rs,
                                 n_classes=cfg["n_classes"],
                                 moment_class=c,
-                                barrier=barrier,
+                                barrier=barrier_m3_diag,
+                                barrier_offdiag=barrier_m3_offdiag,
                                 moment_tolerance=moment3_tolerance,
                                 offdiag_tolerance=moment3_offdiag_tolerance,
                                 centroid_norm=centroid_norm,
@@ -1107,6 +1171,9 @@ def main(cfg_path: str):
                                 n_classes=cfg["n_classes"],
                                 moment_class=c,
                                 barrier=barrier,
+                                barrier_J1=barrier_J1,
+                                barrier_J2=barrier_J2,
+                                barrier_J3=barrier_J3,
                                 lambda_J1=lambda_moment_inv_J1,
                                 lambda_J2=lambda_moment_inv_J2,
                                 lambda_J3=lambda_moment_inv_J3,
@@ -1116,6 +1183,7 @@ def main(cfg_path: str):
                                 centroid_norm=centroid_norm,
                                 return_stats=True,
                                 gamma=moment_inv_gamma,
+                                verbose=moment_verbose,
                             )
                             mis.append(l_c)
                             minv_errs_per_class[c] = s_c
@@ -1204,7 +1272,9 @@ def main(cfg_path: str):
                     f"m2={moment2_loss_v:.4f}(err={moment2_err_v:.2e}) "
                     f"m3={moment3_loss_v:.4f}(err={moment3_err_v:.2e}) "
                     f"minv={moment_inv_loss_v:.4f}(J1={moment_inv_stats_v[0]:.2e},J2={moment_inv_stats_v[1]:.2e},J3={moment_inv_stats_v[2]:.2e}) "
-                    f"t_shape={barrier_shape.t:.2f} t_moment={barrier.t:.2f} "
+                    f"t_shape={barrier_shape.t:.2f} "
+                    f"t_m3={barrier_m3_diag.t:.0f}/{barrier_m3_offdiag.t:.0f} "
+                    f"t_J={barrier_J1.t:.0f}/{barrier_J2.t:.0f}/{barrier_J3.t:.0f} "
                     f"lr={lr_now(opt):.2e}"
                 )
 
@@ -1440,6 +1510,7 @@ def main(cfg_path: str):
                 # schedule
                 "schedule/lr":              lr_now(opt),
                 "schedule/lambda_m3_eff":   lambda_moment3_eff,
+                **{f"schedule/barrier_t_{_n}": _t for _n, _t in _moment_barrier_ts.items()},
                 "schedule/barrier_t_shape": barrier_shape.t,
                 "schedule/barrier_t_moment": barrier.t,
                 **viz_log,

@@ -86,12 +86,44 @@ moment2_tolerance: 0.05
 moment3_tolerance: 0.015  # loosened from 0.01 — see header note on class 4
 moment_inv_tolerance: 0.01
 
-lambda_moment_inv_J1: 1.0       # disable J1
+lambda_moment_inv_J1: 1.0
 lambda_moment_inv_J2: 1.0
 lambda_moment_inv_J3: 1.0
-moment_inv_J1_tolerance: 0.01
-moment_inv_J2_tolerance: 5.0e-4
-moment_inv_J3_tolerance: 1.0e-5
+
+# Tolerances retuned from the measured error trajectory of the previous run
+# (see below). The old values (1e-2 / 5e-4 / 1e-5) were already satisfied by
+# epoch 64 at meanFGDice=0.5855 — err/tol was 79% / 74% / 41% — so the
+# constraints went slack exactly where the segmentation was still mediocre.
+# Assuming an isotropic spread sigma ~ 0.2 in normalized coords (the value that
+# makes all three relative errors agree at ~6-7%, across quantities spanning
+# sigma^2 to sigma^6), the old tolerances were ~8% / 10% / 16% relative.
+# These tighten that to ~3-4% relative so the barrier keeps biting through the
+# Dice 0.7-0.9 range. The [minv class=N J*] verbose lines print the measured GT
+# magnitude and relative error every 10 epochs — use them to re-check sigma.
+moment_inv_J1_tolerance: 4.0e-3
+moment_inv_J2_tolerance: 2.0e-4
+moment_inv_J3_tolerance: 2.5e-6
+
+# --- barrier sharpness for the moment family (moment2 / moment3 / J1-J2-J3) ---
+# LogBarrierLoss switches from its log branch to a linear extension at |z| = 1/t^2.
+# With the legacy shared barrier_t=5 that switch sits at 0.04 — larger than every
+# moment tolerance here — which made the log branch unreachable AND made the upper
+# and lower linear branches (slopes +t and -t) cancel exactly, giving a
+# zero-gradient dead zone of half-width (1/t^2 - tol) around the target. Every
+# moment term was therefore contributing no gradient at all in previous runs.
+#
+# "auto" derives a separate t per term from that term's own tolerance:
+#     1/t^2 = moment_barrier_margin_frac * tol   ->   t = 1/sqrt(margin_frac * tol)
+# Resulting t with the tolerances above: J1=50, J2=224, J3=2000,
+# m3_diag=25.8, m3_offdiag=258. Set to "static" to reproduce the old t=5 behaviour.
+# Individual overrides, if ever needed: moment_barrier_t_J1 / _J2 / _J3 /
+# _m2_diag / _m2_offdiag / _m3_diag / _m3_offdiag (an explicit value wins over the formula).
+moment_barrier_t_mode: auto
+moment_barrier_margin_frac: 0.1
+moment_barrier_t_max: 1.0e4
+# NOTE: barrier_t / barrier_t_mu / barrier_t_max are untouched and still apply
+# only to volume / centroid / avgdist / avgdist_axis, so those stay comparable
+# to earlier runs. barrier_t_mu is unset -> 1.0 -> no per-epoch growth.
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
