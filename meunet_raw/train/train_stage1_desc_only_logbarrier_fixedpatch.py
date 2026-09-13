@@ -33,7 +33,12 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
-from data.dataset_oai_raw_fixedpatch import OAIPairedPatch, load_splits
+from data.dataset_oai_raw_fixedpatch import (
+    OAIPairedPatch,
+    load_splits,
+    compute_average_center,
+    subsample_annotated,
+)
 from models.meunet3d import MEUNet3D
 from losses.dice_ce import DiceCELoss
 from losses.moment_invariants import (
@@ -203,7 +208,7 @@ def soft_dice_per_class(logits, target, n_classes, ignore_index=-1, eps=1e-6):
     return dice.mean(dim=0).cpu().double().tolist()
 
 
-def make_loader(cfg, stems, train: bool, sampler=None):
+def make_loader(cfg, stems, train: bool, sampler=None, fixed_center=None):
     """
     DataLoader for the FIXED 1-STD + 1-EXP patch per case experiment.
 
@@ -223,6 +228,7 @@ def make_loader(cfg, stems, train: bool, sampler=None):
         expand_factor,
         fg_prob,
         train,
+        fixed_center=fixed_center,
     )
 
     loader = DataLoader(
@@ -688,6 +694,63 @@ def main(cfg_path: str):
     if is_main:
         print(f"Fold {fold}: train={len(tr_stems)} val={len(va_stems)}")
 
+    # ------------------------------------------------------------------
+    # weak-annotation ablation (both toggles default to the legacy path)
+    #
+    #   annotated_fraction < 1.0 -> train on that fraction of the fold's train
+    #     stems only. At this stage the withheld cases are simply dropped; the
+    #     descriptor-bank arm that feeds them population targets comes later.
+    #
+    #   fixed_center -> use one shared image-independent patch centre for every
+    #     case instead of each case's GT foreground centre-of-mass. Required for
+    #     any arm involving unannotated cases (their label is unavailable, so a
+    #     GT-derived centre cannot be computed), and it also removes the GT leak
+    #     that GT centering introduces into the centroid descriptor. Validation
+    #     uses the same centre so train/val patches are framed identically.
+    # ------------------------------------------------------------------
+    annotated_fraction = float(cfg.get("annotated_fraction", 1.0))
+    annotation_seed = int(cfg.get("annotation_seed", cfg.get("seed", 777)))
+    unannotated_stems = []
+    if annotated_fraction < 1.0:
+        tr_stems, unannotated_stems = subsample_annotated(
+            tr_stems, annotated_fraction, annotation_seed
+        )
+        if is_main:
+            print(
+                f"[weak] annotated_fraction={annotated_fraction} seed={annotation_seed}: "
+                f"train {len(tr_stems)} annotated / {len(unannotated_stems)} withheld"
+            )
+            with open(workdir / "annotation_split.json", "w") as f:
+                json.dump(
+                    {
+                        "fold": fold,
+                        "annotated_fraction": annotated_fraction,
+                        "annotation_seed": annotation_seed,
+                        "annotated": list(tr_stems),
+                        "unannotated": list(unannotated_stems),
+                    },
+                    f,
+                    indent=2,
+                )
+
+    fixed_center = cfg.get("fixed_center", None)
+    if isinstance(fixed_center, str):
+        if fixed_center.lower() != "auto":
+            raise ValueError(f"fixed_center must be a 3-element list or 'auto', got {fixed_center!r}")
+        # Resolved from the ANNOTATED train stems only, then shared with val so
+        # every patch in the run is framed by the same rule.
+        fixed_center = compute_average_center(cfg["images_dir"], cfg["labels_dir"], tr_stems)
+        if is_main:
+            print(f"[weak] fixed_center: auto -> {fixed_center} (from {len(tr_stems)} annotated cases)")
+    elif fixed_center is not None:
+        fixed_center = tuple(int(round(float(v))) for v in fixed_center)
+        if is_main:
+            print(f"[weak] fixed_center: {fixed_center}")
+
+    if is_main and fixed_center is not None:
+        with open(workdir / "fixed_center.json", "w") as f:
+            json.dump({"fixed_center": list(fixed_center)}, f, indent=2)
+
     expand_factor = float(cfg.get("expand_factor", 1.25))
     fg_prob = float(cfg.get("fg_sampling_prob", 0.5))
 
@@ -695,9 +758,11 @@ def main(cfg_path: str):
         # Build datasets up front to pass to DistributedSampler
         from data.dataset_oai_raw_fixedpatch import OAIPairedPatch
         tr_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], tr_stems,
-                               cfg["patch_size"], expand_factor, fg_prob, True)
+                               cfg["patch_size"], expand_factor, fg_prob, True,
+                               fixed_center=fixed_center)
         va_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], va_stems,
-                               cfg["patch_size"], expand_factor, fg_prob, False)
+                               cfg["patch_size"], expand_factor, fg_prob, False,
+                               fixed_center=fixed_center)
         train_sampler = DistributedSampler(tr_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         val_sampler   = DistributedSampler(va_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
         train_loader  = DataLoader(tr_ds, batch_size=int(cfg["batch_size"]), sampler=train_sampler,
@@ -706,8 +771,8 @@ def main(cfg_path: str):
                                    num_workers=int(cfg["num_workers"]), pin_memory=False, drop_last=False)
     else:
         train_sampler = None
-        train_loader  = make_loader(cfg, tr_stems, train=True)
-        val_loader    = make_loader(cfg, va_stems, train=False)
+        train_loader  = make_loader(cfg, tr_stems, train=True, fixed_center=fixed_center)
+        val_loader    = make_loader(cfg, va_stems, train=False, fixed_center=fixed_center)
 
     # model
     model = MEUNet3D(

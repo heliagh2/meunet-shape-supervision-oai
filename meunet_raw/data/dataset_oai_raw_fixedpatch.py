@@ -168,6 +168,7 @@ class OAIPairedPatch(Dataset):
         expand_factor,
         fg_sampling_prob,   # kept in signature for compatibility; unused now
         train: bool = True, # kept in signature for compatibility
+        fixed_center=None,  # None -> legacy per-case GT foreground centre
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -187,6 +188,14 @@ class OAIPairedPatch(Dataset):
         self.train = bool(train)
         self.image_suffixes = ("_0000", "")
         self.label_suffixes = ("", "_segmentation")
+
+        # None    -> legacy behaviour: one GT-derived centre per case
+        # (z,y,x) -> the same image-derived centre for every case
+        self.fixed_center = None
+        if fixed_center is not None:
+            if len(fixed_center) != 3:
+                raise ValueError(f"fixed_center must have 3 elements, got {fixed_center}")
+            self.fixed_center = tuple(int(round(float(v))) for v in fixed_center)
 
         # Precompute ONE fixed center per case
         self.fixed_centers = {}
@@ -210,6 +219,15 @@ class OAIPairedPatch(Dataset):
         return img, lbl
 
     def _precompute_fixed_centers(self):
+        if self.fixed_center is not None:
+            # Shared image-derived centre: no label is read, so this also works
+            # for cases whose segmentation is withheld (weak-annotation ablation).
+            print(f"[OAIPairedPatch] Using shared fixed center {self.fixed_center} for all "
+                  f"{len(self.stems)} cases (no GT centering).")
+            for stem in self.stems:
+                self.fixed_centers[stem] = self.fixed_center
+            return
+
         print("[OAIPairedPatch] Precomputing one fixed STD/EXP center per case...")
         for stem in self.stems:
             _, lbl = self._load_case(stem)
@@ -288,3 +306,53 @@ def load_splits(cfg):
     train_ids = [_strip_nii_suffix(str(case_id)) for case_id in train_ids]
     val_ids = [_strip_nii_suffix(str(case_id)) for case_id in val_ids]
     return train_ids, val_ids
+def compute_average_center(images_dir, labels_dir, stems, image_suffixes=("_0000", ""),
+                           label_suffixes=("", "_segmentation")):
+    """
+    Average GT foreground centre-of-mass over `stems`, in voxels (z, y, x).
+
+    Used to resolve `fixed_center: auto`. Only the stems passed in are read, so
+    when the weak-annotation ablation is active this must be called with the
+    ANNOTATED subset only — the centre is then a statistic of the labels we are
+    allowed to see, not of the ones we withhold.
+    """
+    images_dir = Path(images_dir)
+    labels_dir = Path(labels_dir)
+
+    coms = []
+    for stem in stems:
+        lbl_path = _resolve_case_file(labels_dir, stem, label_suffixes)
+        lbl = nib.load(str(lbl_path)).get_fdata().astype(np.int16)
+        coms.append(_foreground_center_of_mass(lbl))
+
+    if not coms:
+        raise RuntimeError("compute_average_center called with no stems")
+
+    center = np.mean(np.asarray(coms, dtype=np.float64), axis=0)
+    return tuple(int(round(float(v))) for v in center)
+
+
+def subsample_annotated(stems, fraction, seed):
+    """
+    Deterministically keep `fraction` of `stems` as the annotated subset.
+
+    Returns (annotated, unannotated), both sorted. The permutation depends only
+    on (sorted stems, seed), so a larger fraction is a strict superset of a
+    smaller one for the same seed — the annotation ratios in the ablation are
+    then nested rather than independent draws.
+    """
+    stems = sorted(stems)
+    fraction = float(fraction)
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(f"annotated_fraction must be in (0, 1], got {fraction}")
+
+    if fraction >= 1.0:
+        return list(stems), []
+
+    n_keep = max(1, int(round(len(stems) * fraction)))
+    order = np.random.default_rng(int(seed)).permutation(len(stems))
+    keep = {stems[i] for i in order[:n_keep]}
+
+    annotated = [s for s in stems if s in keep]
+    unannotated = [s for s in stems if s not in keep]
+    return annotated, unannotated
