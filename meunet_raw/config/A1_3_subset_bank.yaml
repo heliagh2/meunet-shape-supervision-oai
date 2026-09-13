@@ -1,13 +1,18 @@
-# === A1.2: weak-annotation ladder, step 2 ===
-# Same 30% subset and shared fixed centre as A1.1; the ONLY change is that the
-# volume and centroid barriers are widened to the bands a population-mean target
-# would require (measured over the 107 annotated cases, ~90% coverage):
-#   volume   0.10 -> 0.40 (relative)   centroid 0.05 -> 0.15 (absolute)
-# Targets are still each case's OWN GT, so this measures the cost of a LOOSE
-# CONSTRAINT alone, separated from the cost of a WRONG (mean) target, which is
-# what the following bank arm adds. avgdist_axis is deliberately left at 0.05:
-# its population spread is small enough that 0.05 already covers 97-100% of
-# cases, so widening it would change the run for no reason.
+# === A1.3: weak-annotation ladder, step 3 ===
+# Same 30% subset, same fixed centre and same widened tolerances as A1.2.
+# The ONLY change: descriptor targets no longer come from each case's own GT but
+# from a population BANK — per-class, per-patch-type mean descriptor values
+# estimated from the annotated cases.
+#
+# This deliberately discards GT we have, so it is a DIAGNOSTIC, not a method:
+#   A1.1 -> A1.2 prices a loose band with a perfect target
+#   A1.2 -> A1.3 prices a wrong (mean) target with the band already loose
+# Without it, a weak A2 could not be attributed to either cause.
+#
+# Expected reading on the collapse metric: vol/cent ratios drop well below 1.0
+# (the bank barrier is minimised by predicting mean anatomy for everyone) while
+# spread_std stays near 1.0, since avgdist_axis population spread is small
+# enough that the mean is nearly as informative as per-case GT.
 
 # dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
 
@@ -16,6 +21,18 @@ images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
 labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
 splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
 dataset_name: Dataset701_OAIKnee
+
+# --- descriptor bank ---
+# auto -> build at startup from the ANNOTATED stems only, cache to
+#   <workdir>/descriptor_bank.json; a path here loads a prebuilt bank instead.
+# Never estimated from withheld cases: that would leak the labels the ablation
+# is pretending not to have.
+descriptor_bank: auto
+# which cases receive bank targets instead of their own GT:
+#   none         -> legacy, every case uses its own GT (A0 / A1.0-A1.2)
+#   unannotated  -> only withheld cases (A2, the actual method)
+#   all          -> every case, GT discarded on purpose (A1.3, this run)
+bank_targets: all
 
 # --- weak-annotation ablation ---
 annotated_fraction: 0.3
@@ -116,5 +133,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: A1.2_subset30_fixedcenter_widetol
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A1_2_subset30_fixedcenter_widetol
+wandb_run_name: A1.3_subset30_bank
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A1_3_subset30_bank
