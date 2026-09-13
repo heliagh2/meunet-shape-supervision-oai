@@ -45,6 +45,10 @@ seed: 777
 log_every: 25
 val_every: 1
 
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
 #Exp toggles 
 use_seg_loss: false         # <— this makes it truly descriptor-only
 monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
@@ -96,5 +100,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: Volume_BatchFix_250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xavg_dist_axis_tolavgdistaxis0.05_scheduled_barrier_t
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250_epochs_center_volume_avgdist_axis_Volume_batch_fix_scheduled_barrier_t
+wandb_run_name: Volume_BatchFix_250_epochs_1xvol_tolVol0.10_5xcent_tolCent0.05_1xavg_dist_axis_tolavgdistaxis0.05_scheduled_barrier_t_oneGPU
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250_epochs_center_volume_avgdist_axis_Volume_batch_fix_scheduled_barrier_t_oneGPU
