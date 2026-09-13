@@ -1,0 +1,161 @@
+# Ablation: 2nd-order central moments (m2, diagonal + off-diagonal) in place of the
+# rotation-invariant J1/J2/J3, with moment3 kept exactly as in the run that worked.
+#
+# What this swaps, scientifically: J1/J2/J3 constrain rotation-invariant summaries of
+# the covariance matrix (trace / sum of 2x2 minors / determinant). m2 constrains the
+# covariance matrix entry-by-entry in voxel-axis coordinates: the diagonal as per-axis
+# sigma_z/y/x (sqrt_diagonal), the off-diagonal as the raw cross-covariances. So m2 is
+# strictly more specific than J1 — same underlying tensor, but orientation-dependent
+# rather than invariant. That is the comparison this run is for.
+#
+# Everything else (data, model, optimizer, seg toggles, volume/centroid barriers,
+# moment3 block, barrier_t for the shape terms) is byte-identical to
+# moments_J1J2J3_m3.yaml so the two runs are directly comparable.
+
+# data
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200]
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+lr_scaling: linear   # base_lr * world_size instead of the default sqrt(world_size)
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#Exp toggles
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all classes
+desc_only_classes: [1, 2, 3, 4]
+centroid_classes: [1, 2, 3, 4]
+volume_classes: [1, 2, 3, 4]
+avgdist_classes: [1, 2, 3, 4]
+avgdist_axis_classes: [1, 2, 3, 4]
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 1.0
+lambda_centroid: 5.0
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+# NOTE: keep lambda_avgdist_axis at 0.0 for this run — avgdist_axis is the per-axis
+# mean distance to the centroid, which measures nearly the same thing as the m2
+# diagonal (per-axis sigma). Enabling both would double-constrain one quantity.
+lambda_avgdist_axis: 0.0        # per-axis spread-to-centroid barrier
+centroid_norm: true             # normalize coords to [0,1]
+
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
+##logbarrier toggles
+# barrier_t: 5.0   — static, no schedule this run (kept isolated from the barrier_t ablation)
+volume_tolerance: 0.10
+centroid_tolerance: 0.05
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.05
+
+# --- moment2: ON, replacing J1/J2/J3 -----------------------------------------
+# Weights kept at the values moments_linearLR_batchnorm_retuned.yaml already ran m2 at,
+# so this run is a clean single-variable test: same m2 settings as that run, with only
+# the barrier-t fix applied on top.
+lambda_moment2: 1.0            # 3 diagonal components -> sigma_z/y/x
+lambda_moment2_offdiag: 0.5    # 3 cross-covariances (c110/c101/c011)
+
+# --- moment3: UNCHANGED from moments_J1J2J3_m3.yaml --------------------------
+lambda_moment3: 0.21       # 10 skewness components, target weight once fully warmed up (diagonal/skew part)
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
+lambda_moment3_offdiag: 0.5
+moment3_offdiag_tolerance: 0.00015
+moment3_tolerance: 0.015  # loosened from 0.01 — see header note on class 4
+
+# --- moment2 tolerances: UNCHANGED from moments_linearLR_batchnorm_retuned.yaml ---
+# Both kept exactly as that run left them. offdiag=0.0015 is data-backed: it was
+# retuned there from 0.005 against errors measured at epoch ~136-160 (observed range
+# 4.9e-4 - 2.1e-3), i.e. deliberately placed inside the observed spread so it binds
+# for the higher-error classes.
+#
+# Worth knowing for the readout: that retune diagnosed the term as "inert" and treated
+# it by tightening the tolerance — but the real cause of the inertness was the barrier
+# t, not the tolerance. At t=5 the dead zone was +/-0.0385 wide, so errors of 4.9e-4 -
+# 2.1e-3 sat inside it and got exactly zero gradient no matter which tolerance was set.
+# So 0.0015 is a sound, data-derived number that has *never actually been exercised*.
+# This run is the first time it bites. Leaving it untouched is what makes that testable.
+#
+# The diagonal (0.05) was never part of that retune, and by the sigma ~ 0.20 estimate
+# from the J-run it is ~25% relative -> expect the epoch-1 [moment2 ... diag(sigma)]
+# line to read "satisfied". If it does, tighten it to ~5e-3 (~2.5% relative) in a
+# follow-up rather than here, so this run stays a single-variable test of the t fix.
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 0.05
+moment2_offdiag_tolerance: 0.0015
+
+# --- moment invariants: OFF for this run -------------------------------------
+lambda_moment_inv_J1: 0.0
+lambda_moment_inv_J2: 0.0
+lambda_moment_inv_J3: 0.0
+moment_inv_J1_tolerance: 4.0e-3
+moment_inv_J2_tolerance: 2.0e-4
+moment_inv_J3_tolerance: 2.5e-6
+moment_inv_tolerance: 0.01
+
+# --- barrier sharpness for the moment family (moment2 / moment3 / J1-J2-J3) ---
+# LogBarrierLoss switches from its log branch to a linear extension at |z| = 1/t^2.
+# With the legacy shared barrier_t=5 that switch sits at 0.04 — larger than every
+# moment tolerance here — which made the log branch unreachable AND made the upper
+# and lower linear branches (slopes +t and -t) cancel exactly, giving a
+# zero-gradient dead zone of half-width (1/t^2 - tol) around the target.
+#
+# "auto" derives a separate t per term from that term's own tolerance:
+#     1/t^2 = moment_barrier_margin_frac * tol   ->   t = 1/sqrt(margin_frac * tol)
+# Resulting t for THIS run: m2_diag=14.1, m2_offdiag=81.6,
+#                           m3_diag=25.8, m3_offdiag=258.2 (m3 unchanged).
+# Previously ALL of these were 5.0, which put every one of them in a zero-gradient
+# dead zone: +/-0.035 for m2_diag, +/-0.0385 for m2_offdiag, +/-0.025 for m3_diag,
+# +/-0.0399 for m3_offdiag — all far wider than the errors those terms ever reached.
+# Set to "static" to reproduce the old t=5 behaviour.
+# Individual overrides, if ever needed: moment_barrier_t_m2_diag / _m2_offdiag /
+# _m3_diag / _m3_offdiag / _J1 / _J2 / _J3 (an explicit value wins over the formula).
+moment_barrier_t_mode: auto
+moment_barrier_margin_frac: 0.1
+moment_barrier_t_max: 1.0e4
+# NOTE: barrier_t / barrier_t_mu / barrier_t_max are untouched and still apply
+# only to volume / centroid / avgdist / avgdist_axis, so those stay comparable
+# to earlier runs. barrier_t_mu is unset -> 1.0 -> no per-epoch growth.
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: 250epochs_m2_m3_adaptedT
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/250epochs_m2_m3_adaptedT

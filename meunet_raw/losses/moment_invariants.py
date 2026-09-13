@@ -73,6 +73,29 @@ def _weighted_moment(w, term, w_sum, gamma=1.0):
     return raw / (f ** gamma * vol)
 
 
+def _report_group(family, moment_class, group, errs, gts, tol, t, eps):
+    """Print measured scale + relative error for one group of moment components.
+
+    Tolerances on raw moment values are hard to pick blind, since the natural
+    magnitude differs per class and per component order. Reporting the GT
+    magnitude alongside the error makes the tolerance calibratable from a run:
+    aim for `tol` a little under the observed rel_err so the barrier keeps
+    biting as the segmentation improves.
+    """
+    if not errs:
+        return
+    e = sum(errs) / len(errs)
+    g = sum(gts) / len(gts)
+    rel = e / max(g, eps)
+    rel_tol = tol / max(g, eps)
+    print(
+        f"        [{family} class={moment_class} {group}] "
+        f"gt={g:.3e} err={e:.3e} rel_err={rel*100:.2f}% "
+        f"tol={tol:.1e} (rel_tol={rel_tol*100:.2f}%) t={t:.1f} "
+        f"{'VIOLATED' if e > tol else 'satisfied'}"
+    )
+
+
 def _barrier_pair(barrier, pred_m, gt_m, tol):
     """Apply log-barrier to enforce gt_m - tol <= pred_m <= gt_m + tol."""
     z_up = pred_m - (gt_m + tol)
@@ -185,6 +208,8 @@ def compute_2nd_moment_barrier(
     errors = [] if (return_stats or verbose) else None
     diag_errors = [] if verbose else None
     offdiag_errors = [] if verbose else None
+    diag_gts = [] if verbose else None
+    offdiag_gts = [] if verbose else None
     for is_diag, pt, gt in terms:
         pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=gamma).squeeze(1)[has_class]
         gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=gamma).squeeze(1)[has_class]
@@ -196,6 +221,7 @@ def compute_2nd_moment_barrier(
             errors.append(err)
             if verbose:
                 (diag_errors if is_diag else offdiag_errors).append(float(err.detach()))
+                (diag_gts if is_diag else offdiag_gts).append(float(gt_m.abs().mean().detach()))
         tol = moment_tolerance if is_diag else offdiag_tolerance
         term_loss = _barrier_pair(barrier if is_diag else barrier_offdiag, pred_m, gt_m, tol)
         if is_diag:
@@ -205,9 +231,10 @@ def compute_2nd_moment_barrier(
         del pt, gt, pred_m, gt_m
 
     if verbose:
-        d = sum(diag_errors) / len(diag_errors)
-        o = sum(offdiag_errors) / len(offdiag_errors)
-        print(f"        [moment2 class={moment_class}] diag(sigma)_err={d:.3e}  offdiag(cov)_err={o:.3e}")
+        _report_group("moment2", moment_class, "diag(sigma) ", diag_errors, diag_gts,
+                      moment_tolerance, barrier.t, eps)
+        _report_group("moment2", moment_class, "offdiag(cov)", offdiag_errors, offdiag_gts,
+                      offdiag_tolerance, barrier_offdiag.t, eps)
 
     if return_stats:
         mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
@@ -417,6 +444,8 @@ def compute_3rd_moment_barrier(
     errors = [] if (return_stats or verbose) else None
     diag_errors = [] if verbose else None
     offdiag_errors = [] if verbose else None
+    diag_gts = [] if verbose else None
+    offdiag_gts = [] if verbose else None
     for is_pure_cubic, pt, gt in terms:
         pred_m = _weighted_moment(pred_w, pt, pred_sum, gamma=gamma).squeeze(1)[has_class]
         gt_m   = _weighted_moment(gt_mask, gt, gt_sum,  gamma=gamma).squeeze(1)[has_class]
@@ -429,6 +458,7 @@ def compute_3rd_moment_barrier(
             errors.append(err)
             if verbose:
                 (diag_errors if is_pure_cubic else offdiag_errors).append(float(err.detach()))
+                (diag_gts if is_pure_cubic else offdiag_gts).append(float(gt_m.abs().mean().detach()))
         tol = moment_tolerance if is_pure_cubic else offdiag_tolerance
         term_loss = _barrier_pair(barrier if is_pure_cubic else barrier_offdiag, pred_m, gt_m, tol)
         if is_pure_cubic:
@@ -440,9 +470,10 @@ def compute_3rd_moment_barrier(
     del dz_p2, dy_p2, dx_p2, dz_g2, dy_g2, dx_g2
 
     if verbose:
-        d = sum(diag_errors) / len(diag_errors)
-        o = sum(offdiag_errors) / len(offdiag_errors)
-        print(f"        [moment3 class={moment_class}] diag(skew)_err={d:.3e}  offdiag(mixed)_err={o:.3e}")
+        _report_group("moment3", moment_class, "diag(skew) ", diag_errors, diag_gts,
+                      moment_tolerance, barrier.t, eps)
+        _report_group("moment3", moment_class, "offdiag(mix)", offdiag_errors, offdiag_gts,
+                      offdiag_tolerance, barrier_offdiag.t, eps)
 
     if return_stats:
         mean_err = torch.stack(errors).mean() if errors else logits_ref.new_tensor(0.0)
