@@ -995,6 +995,7 @@ def main(cfg_path: str):
                 viz_ds = _OAIPairedPatchViz(
                     cfg["images_dir"], cfg["labels_dir"], [viz_stem],
                     cfg["patch_size"], expand_factor, fg_prob, False,
+                    fixed_center=fixed_center,
                 )
                 viz_sample = viz_ds[0]
                 viz_slice_idx = select_viz_slice(
