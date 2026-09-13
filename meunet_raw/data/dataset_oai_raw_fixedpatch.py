@@ -8,6 +8,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
+IGNORE_INDEX = -1
+
+
 def _strip_nii_suffix(name: str) -> str:
     if name.endswith(".nii.gz"):
         return name[:-7]
@@ -169,6 +172,7 @@ class OAIPairedPatch(Dataset):
         fg_sampling_prob,   # kept in signature for compatibility; unused now
         train: bool = True, # kept in signature for compatibility
         fixed_center=None,  # None -> legacy per-case GT foreground centre
+        annotated_stems=None,  # None -> every case is annotated (legacy)
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -196,6 +200,12 @@ class OAIPairedPatch(Dataset):
             if len(fixed_center) != 3:
                 raise ValueError(f"fixed_center must have 3 elements, got {fixed_center}")
             self.fixed_center = tuple(int(round(float(v))) for v in fixed_center)
+
+        # Cases outside this set are loaded WITHOUT their segmentation: the
+        # label is replaced by ignore_index everywhere and has_gt is False, so
+        # nothing downstream can accidentally consume a label the weak-annotation
+        # ablation is pretending not to have.
+        self.annotated_stems = None if annotated_stems is None else set(annotated_stems)
 
         # Precompute ONE fixed center per case
         self.fixed_centers = {}
@@ -259,11 +269,17 @@ class OAIPairedPatch(Dataset):
         std_lbl_t = torch.from_numpy(std_lbl).long()          # (D,H,W)
         exp_lbl_t = torch.from_numpy(exp_lbl).long()          # (D,H,W)
 
+        has_gt = self.annotated_stems is None or stem in self.annotated_stems
+        if not has_gt:
+            std_lbl_t = torch.full_like(std_lbl_t, IGNORE_INDEX)
+            exp_lbl_t = torch.full_like(exp_lbl_t, IGNORE_INDEX)
+
         return {
             "std_img": std_img_t,
             "std_lbl": std_lbl_t,
             "exp_img": exp_img_t,
             "exp_lbl": exp_lbl_t,
+            "has_gt": torch.tensor(bool(has_gt)),
         }
 
 

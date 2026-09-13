@@ -208,6 +208,46 @@ def soft_dice_per_class(logits, target, n_classes, ignore_index=-1, eps=1e-6):
     return dice.mean(dim=0).cpu().double().tolist()
 
 
+DESC_SLICES = {"volume": slice(0, 1), "centroid": slice(1, 4), "spread": slice(4, 7)}
+
+
+def mass_descriptors(mass, tot, eps=1e-6):
+    """
+    Descriptors of a nonnegative mass field, laid out as
+    [frac, cz, cy, cx, sz, sy, sx] -- exactly the quantities the barriers
+    constrain. Differentiable, so it serves both the val-time collapse
+    diagnostic and the training-time distribution loss.
+
+    mass: (B,D,H,W) nonnegative.  tot: (B,) voxel count the fraction is over.
+    """
+    device = mass.device
+    _, D, H, W = mass.shape
+    grids = [
+        torch.linspace(0, 1, D, device=device).view(1, D, 1, 1),
+        torch.linspace(0, 1, H, device=device).view(1, 1, H, 1),
+        torch.linspace(0, 1, W, device=device).view(1, 1, 1, W),
+    ]
+    m = mass.sum(dim=(1, 2, 3)) + eps
+    vals = [mass.sum(dim=(1, 2, 3)) / tot]
+    cents = [(mass * g).sum(dim=(1, 2, 3)) / m for g in grids]
+    vals += cents
+    for g, c in zip(grids, cents):
+        var = (mass * (g - c.view(-1, 1, 1, 1)) ** 2).sum(dim=(1, 2, 3)) / m
+        vals.append(torch.sqrt(var + eps))
+    return torch.stack(vals, dim=1)  # (B,7)
+
+
+def predicted_descriptors(logits, classes, eps=1e-6):
+    """Differentiable descriptors of the predicted softmax mass, (B, len(classes), 7).
+
+    No label is touched — this is the path unannotated cases take.
+    """
+    probs = F.softmax(logits.float(), dim=1)
+    B = probs.shape[0]
+    tot = torch.full((B,), float(np.prod(probs.shape[-3:])), device=probs.device) + eps
+    return torch.stack([mass_descriptors(probs[:, c], tot, eps) for c in classes], dim=1)
+
+
 def descriptor_summary(logits, target, classes, n_classes, ignore_index=-1, eps=1e-6):
     """
     Per-sample descriptor values for the predicted and the GT mask, matching what
@@ -232,34 +272,261 @@ def descriptor_summary(logits, target, classes, n_classes, ignore_index=-1, eps=
     one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
     one_hot = one_hot.to(device) * valid
 
-    B, _, D, H, W = probs.shape
     tot = valid.sum(dim=(2, 3, 4)).squeeze(1) + eps  # (B,)
-    grids = [
-        torch.linspace(0, 1, D, device=device).view(1, D, 1, 1),
-        torch.linspace(0, 1, H, device=device).view(1, 1, H, 1),
-        torch.linspace(0, 1, W, device=device).view(1, 1, 1, W),
-    ]
-
-    def summarize(mass):  # mass: (B,D,H,W)
-        m = mass.sum(dim=(1, 2, 3)) + eps
-        vals = [mass.sum(dim=(1, 2, 3)) / tot]
-        cents = [(mass * g).sum(dim=(1, 2, 3)) / m for g in grids]
-        vals += cents
-        for g, c in zip(grids, cents):
-            var = (mass * (g - c.view(-1, 1, 1, 1)) ** 2).sum(dim=(1, 2, 3)) / m
-            vals.append(torch.sqrt(var + eps))
-        return torch.stack(vals, dim=1)  # (B,7)
 
     preds, gts, present = [], [], []
     for c in classes:
-        preds.append(summarize(probs[:, c]))
-        gts.append(summarize(one_hot[:, c]))
+        preds.append(mass_descriptors(probs[:, c], tot, eps))
+        gts.append(mass_descriptors(one_hot[:, c], tot, eps))
         present.append(one_hot[:, c].sum(dim=(1, 2, 3)) > 0)
 
     return torch.stack(preds, 1), torch.stack(gts, 1), torch.stack(present, 1)
 
 
-def make_loader(cfg, stems, train: bool, sampler=None, fixed_center=None):
+def label_descriptors(lbl, classes, eps=1e-6):
+    """
+    Descriptor values of a single GT label patch, computed exactly as the
+    barriers compute their `gt_*` terms: volume fraction over the whole patch,
+    centroid and per-axis spread in normalised [0,1] patch coordinates, and mean
+    Euclidean distance to the centroid.
+
+    `lbl` must already be at the resolution the barrier sees (see
+    build_descriptor_bank), because volume fraction is not resolution-invariant
+    for thin structures under nearest-neighbour downsampling.
+    """
+    D, H, W = lbl.shape
+    tot = float(lbl.size)
+    grids = [np.linspace(0, 1, D), np.linspace(0, 1, H), np.linspace(0, 1, W)]
+
+    out = {}
+    for c in classes:
+        idx = np.argwhere(lbl == c)
+        if len(idx) == 0:
+            out[int(c)] = None
+            continue
+        coords = [grids[a][idx[:, a]] for a in range(3)]
+        cent = [float(cc.mean()) for cc in coords]
+        spread = [float(np.sqrt(((cc - ce) ** 2).mean())) for cc, ce in zip(coords, cent)]
+        dist = np.sqrt(sum((cc - ce) ** 2 for cc, ce in zip(coords, cent)))
+        out[int(c)] = {
+            "frac": len(idx) / tot,
+            "cent": cent,
+            "spread": spread,
+            "avgdist": float(dist.mean()),
+        }
+    return out
+
+
+def build_descriptor_bank(cfg, stems, fixed_center, classes, shapes, workdir=None, verbose=True):
+    """
+    Population mean of each descriptor, per patch type and per class, estimated
+    from `stems` — which must be the ANNOTATED cases only. Using withheld cases
+    here would leak exactly the labels the ablation pretends not to have.
+
+    `shapes` maps "std"/"exp" to the spatial shape the corresponding barrier
+    operates on. These differ: the STD branch is supervised through logit1 (full
+    patch resolution) while the EXP branch goes through logit2, one decoder level
+    up and therefore half resolution. Volume fractions computed at the wrong
+    resolution are systematically biased for thin classes, so each patch type is
+    measured at its own.
+
+    Returns {"std": {class: {...}}, "exp": {...}}, with the population standard
+    deviation kept alongside each mean for reporting.
+    """
+    ds = OAIPairedPatch(
+        cfg["images_dir"], cfg["labels_dir"], stems,
+        cfg["patch_size"], float(cfg.get("expand_factor", 1.25)),
+        float(cfg.get("fg_sampling_prob", 0.5)), False,
+        fixed_center=fixed_center,
+    )
+
+    acc = {p: {int(c): [] for c in classes} for p in ("std", "exp")}
+    for i in range(len(ds)):
+        item = ds[i]
+        for patch in ("std", "exp"):
+            lbl = item[f"{patch}_lbl"]
+            want = tuple(shapes[patch])
+            if tuple(lbl.shape[-3:]) != want:
+                lbl = F.interpolate(
+                    lbl[None, None].float(), size=want, mode="nearest"
+                )[0, 0].long()
+            d = label_descriptors(lbl.numpy(), classes)
+            for c in classes:
+                if d[int(c)] is not None:
+                    acc[patch][int(c)].append(d[int(c)])
+        if verbose and (i + 1) % 25 == 0:
+            print(f"[bank]   {i + 1}/{len(ds)} cases", flush=True)
+
+    bank = {}
+    for patch in ("std", "exp"):
+        bank[patch] = {}
+        for c in classes:
+            vals = acc[patch][int(c)]
+            if not vals:
+                raise RuntimeError(f"class {c} never present in {patch} patches — cannot build a bank entry")
+            def ms(key):
+                a = np.array([v[key] for v in vals], dtype=np.float64)
+                return a.mean(axis=0).tolist(), a.std(axis=0).tolist()
+            entry = {}
+            for key in ("frac", "cent", "spread", "avgdist"):
+                m, sd = ms(key)
+                entry[key] = m
+                entry[key + "_std"] = sd
+            entry["n"] = len(vals)
+            bank[patch][str(int(c))] = entry
+
+    meta = {
+        "n_stems": len(stems),
+        "fixed_center": list(fixed_center) if fixed_center is not None else None,
+        "shapes": {k: list(v) for k, v in shapes.items()},
+        "classes": [int(c) for c in classes],
+    }
+    out = {"meta": meta, "bank": bank}
+    if workdir is not None:
+        with open(Path(workdir) / "descriptor_bank.json", "w") as f:
+            json.dump(out, f, indent=2)
+    return out
+
+
+def bank_tensors(bank, patch, classes, device):
+    """Pack one patch type's bank into the tensors the barriers expect."""
+    b = bank["bank"][patch]
+    return {
+        "frac": {int(c): torch.tensor(b[str(int(c))]["frac"], dtype=torch.float32, device=device) for c in classes},
+        "cent": {int(c): torch.tensor(b[str(int(c))]["cent"], dtype=torch.float32, device=device) for c in classes},
+        "spread": {int(c): torch.tensor(b[str(int(c))]["spread"], dtype=torch.float32, device=device) for c in classes},
+        "avgdist": {int(c): torch.tensor(b[str(int(c))]["avgdist"], dtype=torch.float32, device=device) for c in classes},
+    }
+
+
+class DescriptorMomentMatcher:
+    """
+    Expectation regularisation over the UNANNOTATED pool.
+
+    A per-sample population target carries zero information about the individual
+    scan, and its barrier is minimised by predicting mean anatomy for every case
+    (see A1.3). This instead constrains the pool's aggregate:
+
+        | mean_i(d_i) - bank_mean |  <= tol_mean
+        | std_i(d_i)  - bank_std   |  <= tol_std
+
+    The std constraint is the part that matters: collapsing onto the mean now
+    VIOLATES a constraint instead of satisfying all of them.
+
+    tol_mean is the standard error of a mean over n_eff samples, k * s/sqrt(n),
+    so the aggregate is pinned much more tightly than any individual case could
+    be -- the population mean is genuinely well known. tol_std is relative.
+
+    batch_size is far too small to estimate a distribution, so each statistic
+    blends the current batch (carrying gradient) with a detached EMA standing in
+    for the rest of the pool:  x_hat = a * batch + (1 - a) * ema,  a = B/n_eff.
+    The EMA is stale by construction; if that proves unstable the exact
+    alternative is accumulating several batches before applying the term.
+    """
+
+    def __init__(self, bank, classes, device, n_eff=64.0, k_mean=2.0, rel_std_tol=0.25, eps=1e-8):
+        self.classes = [int(c) for c in classes]
+        self.n_eff = float(n_eff)
+        self.eps = float(eps)
+        self.state = {}
+        self.target = {}
+        self.active = {}
+        for patch in ("std", "exp"):
+            b = bank["bank"][patch]
+            mu = torch.tensor([[b[str(c)]["frac"]] + list(b[str(c)]["cent"]) + list(b[str(c)]["spread"])
+                               for c in self.classes], dtype=torch.float32, device=device)
+            sd = torch.tensor([[b[str(c)]["frac_std"]] + list(b[str(c)]["cent_std"]) + list(b[str(c)]["spread_std"])
+                               for c in self.classes], dtype=torch.float32, device=device)
+            # A descriptor the annotated cases show no spread in carries no
+            # distribution to match. Constraining it would demand sd == 0
+            # exactly, which is unsatisfiable; disable those entries instead.
+            degenerate = sd <= 1e-8
+            self.active[patch] = ~degenerate
+            sd = sd.clamp(min=self.eps)
+            self.target[patch] = {
+                "mu": mu,
+                "sd": sd,
+                "tol_mu": k_mean * sd / math.sqrt(self.n_eff),
+                "tol_sd": rel_std_tol * sd,
+            }
+            if bool(degenerate.any()):
+                print(f"[dist] warning: {int(degenerate.sum())} {patch} descriptor(s) have zero "
+                      f"population spread — their distribution constraints are disabled.")
+            # EMA seeded at the bank itself: before any evidence, assume the pool
+            # already matches, so early batches move it rather than fight an
+            # arbitrary initial value.
+            self.state[patch] = {"mu": mu.clone(), "e2": (mu ** 2 + sd ** 2).clone()}
+
+    def __call__(self, logits, patch, barrier, group_weights):
+        """
+        logits: (Bu,C,...) for the unannotated samples of this batch.
+        group_weights: {"volume": w, "centroid": w, "spread": w} -- the same
+        lambdas the per-sample barriers use, so the two paths stay commensurate.
+        Returns (loss, stats).
+        """
+        pred = predicted_descriptors(logits, self.classes)      # (Bu, C, 7)
+        Bu = pred.shape[0]
+        a = min(1.0, Bu / self.n_eff)
+
+        st, tg = self.state[patch], self.target[patch]
+        batch_mu = pred.mean(dim=0)
+        batch_e2 = (pred ** 2).mean(dim=0)
+
+        mu_hat = a * batch_mu + (1.0 - a) * st["mu"]
+        e2_hat = a * batch_e2 + (1.0 - a) * st["e2"]
+        sd_hat = torch.sqrt((e2_hat - mu_hat ** 2).clamp(min=self.eps))
+
+        with torch.no_grad():
+            st["mu"] = (1.0 - a) * st["mu"] + a * batch_mu.detach()
+            st["e2"] = (1.0 - a) * st["e2"] + a * batch_e2.detach()
+
+        z_mu = torch.maximum(mu_hat - (tg["mu"] + tg["tol_mu"]), (tg["mu"] - tg["tol_mu"]) - mu_hat)
+        z_sd = torch.maximum(sd_hat - (tg["sd"] + tg["tol_sd"]), (tg["sd"] - tg["tol_sd"]) - sd_hat)
+
+        act = self.active[patch]
+        loss = logits.new_tensor(0.0)
+        for name, sl in DESC_SLICES.items():
+            w = float(group_weights.get(name, 0.0))
+            if w <= 0.0:
+                continue
+            a = act[:, sl]
+            if not bool(a.any()):
+                continue
+            loss = loss + w * (barrier(z_mu[:, sl][a]) + barrier(z_sd[:, sl][a]))
+
+        stats = {
+            "z_mu": z_mu.detach(), "z_sd": z_sd.detach(), "active": act,
+            "sd_ratio": (sd_hat / tg["sd"]).detach(),
+            "mu_hat": mu_hat.detach(), "sd_hat": sd_hat.detach(),
+            "n_unannotated": Bu,
+        }
+        return loss, stats
+
+    def report(self, patch, classes):
+        """Human-readable constraint status from the current EMA state."""
+        st, tg = self.state[patch], self.target[patch]
+        sd = torch.sqrt((st["e2"] - st["mu"] ** 2).clamp(min=self.eps))
+        z_mu = torch.maximum(st["mu"] - (tg["mu"] + tg["tol_mu"]), (tg["mu"] - tg["tol_mu"]) - st["mu"])
+        z_sd = torch.maximum(sd - (tg["sd"] + tg["tol_sd"]), (tg["sd"] - tg["tol_sd"]) - sd)
+        act = self.active[patch]
+        lines = []
+        for i, c in enumerate(classes):
+            for name, sl in DESC_SLICES.items():
+                a = act[i, sl]
+                if not bool(a.any()):
+                    lines.append(f"      {patch} c{c} {name:<8} (disabled: no population spread)")
+                    continue
+                zm = float(z_mu[i, sl][a].max())
+                zs = float(z_sd[i, sl][a].max())
+                ok_m = "ok " if zm <= 0 else "VIOL"
+                ok_s = "ok " if zs <= 0 else "VIOL"
+                ratio = float((sd[i, sl][a] / tg["sd"][i, sl][a]).mean())
+                lines.append(f"      {patch} c{c} {name:<8} mean {ok_m} z={zm:+.4f} | "
+                             f"std {ok_s} z={zs:+.4f} | sd/bank={ratio:.2f}")
+        return lines
+
+
+def make_loader(cfg, stems, train: bool, sampler=None, fixed_center=None, annotated_stems=None):
     """
     DataLoader for the FIXED 1-STD + 1-EXP patch per case experiment.
 
@@ -280,6 +547,7 @@ def make_loader(cfg, stems, train: bool, sampler=None, fixed_center=None):
         fg_prob,
         train,
         fixed_center=fixed_center,
+        annotated_stems=annotated_stems,
     )
 
     loader = DataLoader(
@@ -341,6 +609,36 @@ class LogBarrierLoss:
 
 # descriptor constraints via log barrier
 
+def _sample_tol(tol, B, device):
+    """
+    Tolerance as a per-sample (B,1) tensor.
+
+    A batch can mix cases supervised by their own GT (tight band) with cases
+    supervised by a population mean (which needs a band wide enough to cover the
+    anatomical spread). A single scalar would hand the bank-supervised cases an
+    infeasible constraint, so the caller may pass a per-sample vector instead.
+    """
+    if torch.is_tensor(tol):
+        return tol.to(device=device, dtype=torch.float32).view(-1, 1)
+    return torch.full((B, 1), float(tol), device=device, dtype=torch.float32)
+
+
+def _bank_valid(valid, use_bank):
+    """
+    Voxel-validity mask, widened for samples supervised by the bank.
+
+    Normally `valid` marks voxels whose label is usable. A bank-supervised case
+    has no usable label at all, but its IMAGE is entirely real — the descriptor
+    is compared against a population value over the whole patch. Without this the
+    mask would be all-zero for such a case and the volume denominator would
+    collapse to eps.
+    """
+    if use_bank is None:
+        return valid
+    ub = use_bank.view(-1, 1, 1, 1, 1).to(valid.dtype)
+    return torch.clamp(valid + ub, max=1.0)
+
+
 def compute_volume_barrier(
     logits,
     target,
@@ -350,6 +648,8 @@ def compute_volume_barrier(
     volume_tolerance=0.10,
     ignore_index=-1,
     eps=1e-6,
+    use_bank=None,
+    bank_value=None,
 ):
     """
     Enforce:
@@ -366,6 +666,7 @@ def compute_volume_barrier(
     probs = F.softmax(logits.float(), dim=1)
 
     valid = (target != ignore_index).float().unsqueeze(1)  # (B,1,D,H,W)
+    valid = _bank_valid(valid, use_bank)
     probs = probs * valid
 
     one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
@@ -387,8 +688,13 @@ def compute_volume_barrier(
     pred_sel = pred_frac[:, cls_idx]
     gt_sel   = gt_frac[:, cls_idx]
 
-    lower = gt_sel * (1.0 - volume_tolerance)
-    upper = gt_sel * (1.0 + volume_tolerance)
+    if use_bank is not None:
+        bank_sel = bank_value.to(device=device, dtype=gt_sel.dtype).view(1, -1)
+        gt_sel = torch.where(use_bank.view(-1, 1), bank_sel.expand_as(gt_sel), gt_sel)
+
+    vtol = _sample_tol(volume_tolerance, gt_sel.shape[0], device)
+    lower = gt_sel * (1.0 - vtol)
+    upper = gt_sel * (1.0 + vtol)
 
     z_upper = pred_sel - upper   # <= 0 wanted
     z_lower = lower - pred_sel   # <= 0 wanted
@@ -406,6 +712,8 @@ def compute_centroid_barrier(
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    use_bank=None,
+    bank_value=None,
 ):
     """
     Enforce:
@@ -418,6 +726,7 @@ def compute_centroid_barrier(
     device = logits.device
     probs = F.softmax(logits.float(), dim=1)
     valid = (target != ignore_index).float().unsqueeze(1)
+    valid = _bank_valid(valid, use_bank)
 
     one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
     one_hot = one_hot.to(device)
@@ -451,15 +760,23 @@ def compute_centroid_barrier(
     pred_centroid = (pred_w * coords).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
     gt_centroid   = (gt_mask * coords).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
 
+    if use_bank is not None:
+        bank_c = bank_value.to(device=device, dtype=gt_centroid.dtype).view(1, 3)
+        gt_centroid = torch.where(use_bank.view(-1, 1), bank_c.expand_as(gt_centroid), gt_centroid)
+
     has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if use_bank is not None:
+        # a bank-supervised sample is constrained even though its GT is unusable
+        has_class = has_class | use_bank
     if not has_class.any():
         return logits.new_tensor(0.0)
 
     pred_c = pred_centroid[has_class]
     gt_c   = gt_centroid[has_class]
+    ctol   = _sample_tol(centroid_tolerance, gt_centroid.shape[0], device)[has_class]
 
-    upper = gt_c + centroid_tolerance
-    lower = gt_c - centroid_tolerance
+    upper = gt_c + ctol
+    lower = gt_c - ctol
 
     z_upper = pred_c - upper     # <= 0 wanted
     z_lower = lower - pred_c     # <= 0 wanted
@@ -477,6 +794,8 @@ def compute_avgdist_barrier(
     centroid_norm=True,
     ignore_index=-1,
     eps=1e-6,
+    use_bank=None,
+    bank_value=None,
 ):
     """
     Enforce:
@@ -487,6 +806,7 @@ def compute_avgdist_barrier(
     device = logits.device
     probs = F.softmax(logits.float(), dim=1)
     valid = (target != ignore_index).float().unsqueeze(1)
+    valid = _bank_valid(valid, use_bank)
 
     one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
     one_hot = one_hot.to(device)
@@ -526,15 +846,22 @@ def compute_avgdist_barrier(
     pred_avgdist = (pred_w * pred_dist).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
     gt_avgdist = (gt_mask * gt_dist).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
 
+    if use_bank is not None:
+        bank_d = bank_value.to(device=device, dtype=gt_avgdist.dtype).view(1, 1)
+        gt_avgdist = torch.where(use_bank.view(-1, 1), bank_d.expand_as(gt_avgdist), gt_avgdist)
+
     has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if use_bank is not None:
+        has_class = has_class | use_bank
     if not has_class.any():
         return logits.new_tensor(0.0)
 
     pred_d = pred_avgdist[has_class]
     gt_d = gt_avgdist[has_class]
+    dtol = _sample_tol(avgdist_tolerance, gt_avgdist.shape[0], device)[has_class]
 
-    upper = gt_d + avgdist_tolerance
-    lower = gt_d - avgdist_tolerance
+    upper = gt_d + dtol
+    lower = gt_d - dtol
 
     z_upper = pred_d - upper
     z_lower = lower - pred_d
@@ -553,6 +880,8 @@ def compute_avgdist_axis_barrier(
     ignore_index=-1,
     eps=1e-6,
     return_stats=False,
+    use_bank=None,
+    bank_value=None,
 ):
     """
     Enforce:
@@ -563,6 +892,7 @@ def compute_avgdist_axis_barrier(
     device = logits.device
     probs = F.softmax(logits.float(), dim=1)
     valid = (target != ignore_index).float().unsqueeze(1)
+    valid = _bank_valid(valid, use_bank)
 
     one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
     one_hot = one_hot.to(device)
@@ -590,6 +920,8 @@ def compute_avgdist_axis_barrier(
     gt_centroids = [(gt_mask * axis_grid).sum(dim=(2, 3, 4), keepdim=True) / gt_sum for axis_grid in grids]
 
     has_class = (gt_mask.sum(dim=(2, 3, 4)) > 0).squeeze(1)
+    if use_bank is not None:
+        has_class = has_class | use_bank
     if not has_class.any():
         if return_stats:
             return logits.new_tensor(0.0), logits.new_zeros(3)
@@ -597,14 +929,20 @@ def compute_avgdist_axis_barrier(
 
     barrier_loss = logits.new_tensor(0.0)
     axis_stats = []
-    for axis_grid, pred_c_axis, gt_c_axis in zip(grids, pred_centroids, gt_centroids):
+    for axis_i, (axis_grid, pred_c_axis, gt_c_axis) in enumerate(zip(grids, pred_centroids, gt_centroids)):
         pred_axis_var = (pred_w * (axis_grid - pred_c_axis) ** 2).sum(dim=(2, 3, 4)) / pred_sum.squeeze(-1).squeeze(-1).squeeze(-1)
         gt_axis_var = (gt_mask * (axis_grid - gt_c_axis) ** 2).sum(dim=(2, 3, 4)) / gt_sum.squeeze(-1).squeeze(-1).squeeze(-1)
-        pred_s = torch.sqrt(pred_axis_var + eps)[has_class]
-        gt_s = torch.sqrt(gt_axis_var + eps)[has_class]
+        gt_s_full = torch.sqrt(gt_axis_var + eps)
+        if use_bank is not None:
+            bank_s = bank_value.to(device=device, dtype=gt_s_full.dtype).view(1, -1)[:, axis_i:axis_i + 1]
+            gt_s_full = torch.where(use_bank.view(-1, 1), bank_s.expand_as(gt_s_full), gt_s_full)
 
-        upper = gt_s + avgdist_axis_tolerance
-        lower = gt_s - avgdist_axis_tolerance
+        pred_s = torch.sqrt(pred_axis_var + eps)[has_class]
+        gt_s = gt_s_full[has_class]
+        atol = _sample_tol(avgdist_axis_tolerance, gt_s_full.shape[0], device)[has_class]
+
+        upper = gt_s + atol
+        lower = gt_s - atol
 
         z_upper = pred_s - upper
         z_lower = lower - pred_s
@@ -784,15 +1122,32 @@ def main(cfg_path: str):
                     indent=2,
                 )
 
+    # How the withheld cases are used (must be decided before the loaders exist):
+    #   drop         -> not loaded at all (A1.x)
+    #   bank         -> loaded, each given the population mean as its own target (A2)
+    #   distribution -> loaded, constrained only in aggregate (A1.4)
+    unannotated_mode = str(cfg.get("unannotated_mode", "drop")).lower()
+    if unannotated_mode not in ("drop", "bank", "distribution"):
+        raise ValueError(f"unannotated_mode must be drop|bank|distribution, got {unannotated_mode!r}")
+    if unannotated_mode != "drop" and not unannotated_stems:
+        raise ValueError(f"unannotated_mode={unannotated_mode} requires annotated_fraction < 1.0")
+
+    annotated_stems = list(tr_stems)
+    if unannotated_mode != "drop":
+        tr_stems = sorted(list(tr_stems) + list(unannotated_stems))
+        if is_main:
+            print(f"[weak] unannotated_mode={unannotated_mode}: training on {len(tr_stems)} cases "
+                  f"({len(annotated_stems)} with GT, {len(unannotated_stems)} label-withheld)")
+
     fixed_center = cfg.get("fixed_center", None)
     if isinstance(fixed_center, str):
         if fixed_center.lower() != "auto":
             raise ValueError(f"fixed_center must be a 3-element list or 'auto', got {fixed_center!r}")
         # Resolved from the ANNOTATED train stems only, then shared with val so
         # every patch in the run is framed by the same rule.
-        fixed_center = compute_average_center(cfg["images_dir"], cfg["labels_dir"], tr_stems)
+        fixed_center = compute_average_center(cfg["images_dir"], cfg["labels_dir"], annotated_stems)
         if is_main:
-            print(f"[weak] fixed_center: auto -> {fixed_center} (from {len(tr_stems)} annotated cases)")
+            print(f"[weak] fixed_center: auto -> {fixed_center} (from {len(annotated_stems)} annotated cases)")
     elif fixed_center is not None:
         fixed_center = tuple(int(round(float(v))) for v in fixed_center)
         if is_main:
@@ -810,7 +1165,8 @@ def main(cfg_path: str):
         from data.dataset_oai_raw_fixedpatch import OAIPairedPatch
         tr_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], tr_stems,
                                cfg["patch_size"], expand_factor, fg_prob, True,
-                               fixed_center=fixed_center)
+                               fixed_center=fixed_center,
+                               annotated_stems=(annotated_stems if unannotated_mode != "drop" else None))
         va_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], va_stems,
                                cfg["patch_size"], expand_factor, fg_prob, False,
                                fixed_center=fixed_center)
@@ -822,7 +1178,8 @@ def main(cfg_path: str):
                                    num_workers=int(cfg["num_workers"]), pin_memory=False, drop_last=False)
     else:
         train_sampler = None
-        train_loader  = make_loader(cfg, tr_stems, train=True, fixed_center=fixed_center)
+        train_loader  = make_loader(cfg, tr_stems, train=True, fixed_center=fixed_center,
+                                    annotated_stems=(annotated_stems if unannotated_mode != "drop" else None))
         val_loader    = make_loader(cfg, va_stems, train=False, fixed_center=fixed_center)
 
     # model
@@ -1058,6 +1415,101 @@ def main(cfg_path: str):
                 viz_ready = True
                 print(f"[viz] Tracking patient={viz_stem} slice={viz_slice_idx} (axis={viz_slice_axis})")
 
+    # ------------------------------------------------------------------
+    # descriptor bank (population targets). bank_targets:
+    #   none        -> every case uses its own GT (legacy; A0 / A1.0-A1.2)
+    #   all         -> every case uses bank targets, GT discarded (A1.3)
+    #   unannotated -> only withheld cases use the bank (A2)
+    # ------------------------------------------------------------------
+    bank_targets = str(cfg.get("bank_targets", "none")).lower()
+    if bank_targets not in ("none", "all"):
+        raise ValueError(f"bank_targets must be none|all, got {bank_targets!r} "
+                         "(use unannotated_mode for how WITHHELD cases are supervised)")
+
+    if unannotated_mode != "drop" and bank_targets != "none":
+        raise ValueError("bank_targets and unannotated_mode are alternatives; set bank_targets: none")
+
+    need_bank = (bank_targets != "none") or (unannotated_mode != "drop")
+    lambda_dist = float(cfg.get("lambda_dist", 1.0))
+    # Tolerances applied to cases whose target is the population mean rather
+    # than their own GT: the band has to cover the anatomical spread, not just
+    # prediction slack. Default to the GT values so behaviour is unchanged when
+    # no population targets are in play.
+    bank_volume_tolerance = float(cfg.get("bank_volume_tolerance", cfg.get("volume_tolerance", 0.10)))
+    bank_centroid_tolerance = float(cfg.get("bank_centroid_tolerance", cfg.get("centroid_tolerance", 0.05)))
+    bank_avgdist_tolerance = float(cfg.get("bank_avgdist_tolerance", cfg.get("avgdist_tolerance", 0.05)))
+    bank_avgdist_axis_tolerance = float(cfg.get("bank_avgdist_axis_tolerance", cfg.get("avgdist_axis_tolerance", 0.05)))
+    bank_classes = sorted(set(volume_classes) | set(centroid_classes)
+                          | set(avgdist_classes) | set(avgdist_axis_classes))
+    constraint_report_every = int(cfg.get("constraint_report_every", 5))
+
+    bank = None
+    bank_std = bank_exp = None
+    matcher = None
+    if need_bank:
+        for name, lam in (("moment2", lambda_moment2), ("moment3", lambda_moment3),
+                          ("moment_inv", lambda_moment_inv_J1 + lambda_moment_inv_J2 + lambda_moment_inv_J3)):
+            if lam > 0.0:
+                raise NotImplementedError(
+                    f"population targets with lambda_{name}>0: the moment barriers still "
+                    "derive their targets from GT and have no bank/distribution path."
+                )
+
+        # Resolutions the two branches are actually supervised at: STD goes
+        # through logit1 (full patch), EXP through logit2 (one decoder level up).
+        raw_model_for_shape = model.module if use_ddp else model
+        with torch.no_grad():
+            probe = torch.zeros(1, int(cfg["in_channels"]), *cfg["patch_size"], device=device)
+            o = raw_model_for_shape(probe, expanded=False)
+            std_shape = tuple(int(v) for v in o["logit1"].shape[-3:])
+            exp_shape = tuple(int(v) for v in o["logit2"].shape[-3:])
+            del probe, o
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        shapes = {"std": std_shape, "exp": exp_shape}
+        if is_main:
+            print(f"[bank] barrier resolutions: std(logit1)={std_shape} exp(logit2)={exp_shape}")
+
+        bank_src = cfg.get("descriptor_bank", "auto")
+        if isinstance(bank_src, str) and bank_src.lower() == "auto":
+            if is_main:
+                print(f"[bank] building from {len(annotated_stems)} annotated cases, classes {bank_classes}...")
+            bank = build_descriptor_bank(cfg, annotated_stems, fixed_center, bank_classes, shapes,
+                                         workdir=workdir if is_main else None, verbose=is_main)
+        else:
+            with open(bank_src, "r") as f:
+                bank = json.load(f)
+            if is_main:
+                print(f"[bank] loaded from {bank_src}")
+
+        bank_std = bank_tensors(bank, "std", bank_classes, device)
+        bank_exp = bank_tensors(bank, "exp", bank_classes, device)
+
+        if unannotated_mode == "distribution":
+            matcher = DescriptorMomentMatcher(
+                bank, bank_classes, device,
+                n_eff=float(cfg.get("dist_n_eff", 64.0)),
+                k_mean=float(cfg.get("dist_k_mean", 2.0)),
+                rel_std_tol=float(cfg.get("dist_rel_std_tol", 0.25)),
+            )
+            if is_main:
+                tg = matcher.target["std"]
+                print(f"[dist] moment matching on the unannotated pool: n_eff={matcher.n_eff:.0f} "
+                      f"k_mean={float(cfg.get('dist_k_mean', 2.0))} rel_std_tol={float(cfg.get('dist_rel_std_tol', 0.25))}")
+                for i, c in enumerate(bank_classes):
+                    print(f"[dist]   std c{c} volume: target mu={float(tg['mu'][i,0]):.5f} "
+                          f"+-{float(tg['tol_mu'][i,0]):.5f}  sd={float(tg['sd'][i,0]):.5f} "
+                          f"+-{float(tg['tol_sd'][i,0]):.5f}")
+
+        if is_main:
+            print(f"[bank] per-sample targets applied to: {bank_targets}")
+            for patch in ("std", "exp"):
+                for c in bank_classes:
+                    e = bank["bank"][patch][str(c)]
+                    print(f"[bank]   {patch} c{c}: frac={e['frac']:.5f} (+-{e['frac_std']:.5f}) "
+                          f"cent={[round(v,4) for v in e['cent']]} "
+                          f"spread={[round(v,4) for v in e['spread']]}")
+
     # descriptor-collapse diagnostic (OFF unless the config asks for it): every
     # Nth validation, compare the spread of PREDICTED descriptors over the val
     # set against the spread of the GT ones. Set collapse_log_every_n_vals: 5
@@ -1091,6 +1543,9 @@ def main(cfg_path: str):
 
         model.train()
         loss_sum_total = 0.0
+        loss_sum_dist = 0.0
+        n_dist = 0
+        dist_last = {}
         loss_sum_seg_logged = 0.0
         loss_sum_seg_bw = 0.0
         loss_sum_vol = 0.0
@@ -1134,18 +1589,55 @@ def main(cfg_path: str):
 
                 lbl_rs = resize_lbl_to_logits(lbl, logits)
 
+                # Split the batch by supervision source. `has_gt` is all-True
+                # unless withheld cases are being loaded.
+                has_gt = batch.get("has_gt")
+                has_gt = (torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
+                          if has_gt is None else has_gt.to(logits.device).bool())
+                patch_key = "exp" if expanded else "std"
+                bk = bank_exp if expanded else bank_std
+
+                if bank_targets == "all":
+                    # every case takes a per-sample population target (A1.3)
+                    use_bank = torch.ones_like(has_gt)
+                    desc_logits, desc_lbl = logits, lbl_rs
+                elif unannotated_mode == "bank":
+                    # withheld cases take per-sample population targets (A2)
+                    use_bank = ~has_gt
+                    desc_logits, desc_lbl = logits, lbl_rs
+                else:
+                    # GT-only per-sample barriers; withheld cases (if any) are
+                    # handled by the distribution term instead, so they must be
+                    # excluded here -- their label is pure ignore and would
+                    # otherwise drive every descriptor toward zero.
+                    use_bank = None
+                    if bool(has_gt.all()):
+                        desc_logits, desc_lbl = logits, lbl_rs
+                    else:
+                        gt_idx = has_gt.nonzero(as_tuple=False).squeeze(1)
+                        desc_logits, desc_lbl = logits[gt_idx], lbl_rs[gt_idx]
+
+                # Seg loss (monitored and, if enabled, backward) must only ever
+                # see cases that actually have a label: DiceCE on an all-ignore
+                # target is NaN, not zero.
+                if bool(has_gt.all()):
+                    seg_logits, seg_lbl = logits, lbl_rs
+                else:
+                    _sidx = has_gt.nonzero(as_tuple=False).squeeze(1)
+                    seg_logits, seg_lbl = logits[_sidx], lbl_rs[_sidx]
+
                 # monitor-only seg loss
-                if monitor_seg_loss:
-                    seg_loss_logged = crit(logits, lbl_rs)
+                if monitor_seg_loss and seg_logits.shape[0] > 0:
+                    seg_loss_logged = crit(seg_logits, seg_lbl)
                 else:
                     seg_loss_logged = logits.new_tensor(0.0)
 
                 # seg loss used for backward
-                if use_seg_loss:
-                    logits_for_bw = logits
+                if use_seg_loss and seg_logits.shape[0] > 0:
+                    logits_for_bw = seg_logits
                     if detach_for_seg and desc_classes:
-                        logits_for_bw = detach_channels_for_seg_loss(logits, desc_classes)
-                    seg_loss_bw = crit(logits_for_bw, lbl_rs)
+                        logits_for_bw = detach_channels_for_seg_loss(seg_logits, desc_classes)
+                    seg_loss_bw = crit(logits_for_bw, seg_lbl)
                 else:
                     seg_loss_bw = logits.new_tensor(0.0)
 
@@ -1172,15 +1664,33 @@ def main(cfg_path: str):
                 m3_errs_per_class = {c: logits.new_tensor(0.0) for c in moment3_classes}
                 minv_errs_per_class = {c: logits.new_zeros(3) for c in moment_inv_classes}
 
-                if apply_shape:
+                # GT-supervised samples keep the tight band; bank-supervised
+                # ones get the wide band. Scalars when the batch is uniform.
+                if use_bank is not None and bool(use_bank.any()) and not bool(use_bank.all()):
+                    _ub = use_bank.float()
+                    vol_tol_b = volume_tolerance + _ub * (bank_volume_tolerance - volume_tolerance)
+                    cent_tol_b = centroid_tolerance + _ub * (bank_centroid_tolerance - centroid_tolerance)
+                    avgd_tol_b = avgdist_tolerance + _ub * (bank_avgdist_tolerance - avgdist_tolerance)
+                    axis_tol_b = avgdist_axis_tolerance + _ub * (bank_avgdist_axis_tolerance - avgdist_axis_tolerance)
+                elif use_bank is not None and bool(use_bank.all()):
+                    vol_tol_b, cent_tol_b = bank_volume_tolerance, bank_centroid_tolerance
+                    avgd_tol_b, axis_tol_b = bank_avgdist_tolerance, bank_avgdist_axis_tolerance
+                else:
+                    vol_tol_b, cent_tol_b = volume_tolerance, centroid_tolerance
+                    avgd_tol_b, axis_tol_b = avgdist_tolerance, avgdist_axis_tolerance
+
+                if apply_shape and desc_logits.shape[0] > 0:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
                         vol_loss = compute_volume_barrier(
-                            logits=logits,
-                            target=lbl_rs,
+                            logits=desc_logits,
+                            target=desc_lbl,
                             n_classes=cfg["n_classes"],
                             volume_classes=volume_classes,
                             barrier=barrier_shape,
-                            volume_tolerance=volume_tolerance,
+                            volume_tolerance=vol_tol_b,
+                            use_bank=use_bank,
+                            bank_value=(torch.stack([bk["frac"][int(c)] for c in volume_classes])
+                                        if use_bank is not None else None),
                         )
 
                     if lambda_centroid > 0.0 and len(centroid_classes) > 0:
@@ -1188,13 +1698,15 @@ def main(cfg_path: str):
                         for c in centroid_classes:
                             cents.append(
                                 compute_centroid_barrier(
-                                    logits=logits,
-                                    target=lbl_rs,
+                                    logits=desc_logits,
+                                    target=desc_lbl,
                                     n_classes=cfg["n_classes"],
                                     centroid_class=c,
                                     barrier=barrier_shape,
-                                    centroid_tolerance=centroid_tolerance,
+                                    centroid_tolerance=cent_tol_b,
                                     centroid_norm=centroid_norm,
+                                    use_bank=use_bank,
+                                    bank_value=(bk["cent"][int(c)] if use_bank is not None else None),
                                 )
                             )
                         cent_loss = torch.stack(cents).mean() if len(cents) > 0 else logits.new_tensor(0.0)
@@ -1204,13 +1716,15 @@ def main(cfg_path: str):
                         for c in avgdist_classes:
                             avgdists.append(
                                 compute_avgdist_barrier(
-                                    logits=logits,
-                                    target=lbl_rs,
+                                    logits=desc_logits,
+                                    target=desc_lbl,
                                     n_classes=cfg["n_classes"],
                                     distance_class=c,
                                     barrier=barrier_shape,
-                                    avgdist_tolerance=avgdist_tolerance,
+                                    avgdist_tolerance=avgd_tol_b,
                                     centroid_norm=centroid_norm,
+                                    use_bank=use_bank,
+                                    bank_value=(bk["avgdist"][int(c)] if use_bank is not None else None),
                                 )
                             )
                         avgdist_loss = torch.stack(avgdists).mean() if len(avgdists) > 0 else logits.new_tensor(0.0)
@@ -1220,14 +1734,16 @@ def main(cfg_path: str):
                         avgdist_axis_stats_all = []
                         for c in avgdist_axis_classes:
                             axis_loss_c, axis_stats_c = compute_avgdist_axis_barrier(
-                                    logits=logits,
-                                    target=lbl_rs,
+                                    logits=desc_logits,
+                                    target=desc_lbl,
                                     n_classes=cfg["n_classes"],
                                     distance_class=c,
                                     barrier=barrier_shape,
-                                    avgdist_axis_tolerance=avgdist_axis_tolerance,
+                                    avgdist_axis_tolerance=axis_tol_b,
                                     centroid_norm=centroid_norm,
                                     return_stats=True,
+                                    use_bank=use_bank,
+                                    bank_value=(bk["spread"][int(c)] if use_bank is not None else None),
                                 )
                             avgdist_axes.append(axis_loss_c)
                             avgdist_axis_stats_all.append(axis_stats_c)
@@ -1288,6 +1804,20 @@ def main(cfg_path: str):
                         moment3_offdiag_loss = torch.stack(m3_offdiags).mean() if m3_offdiags else logits.new_tensor(0.0)
                         moment3_err  = torch.stack(list(m3_errs_per_class.values())).mean() if m3_errs_per_class else logits.new_tensor(0.0)
 
+                    pass
+
+                dist_loss = logits.new_tensor(0.0)
+                dist_stats = None
+                if matcher is not None and apply_shape and not bool(has_gt.all()):
+                    u_idx = (~has_gt).nonzero(as_tuple=False).squeeze(1)
+                    if u_idx.numel() > 0:
+                        dist_loss, dist_stats = matcher(
+                            logits[u_idx], patch_key, barrier_shape,
+                            {"volume": lambda_volume, "centroid": lambda_centroid,
+                             "spread": lambda_avgdist_axis},
+                        )
+
+                if apply_shape and desc_logits.shape[0] > 0:
                     _any_inv_active = any(l > 0.0 for l in [lambda_moment_inv_J1, lambda_moment_inv_J2, lambda_moment_inv_J3])
                     if _any_inv_active and len(moment_inv_classes) > 0:
                         mis = []
@@ -1331,6 +1861,7 @@ def main(cfg_path: str):
                     + lambda_moment3_eff * moment3_diag_loss
                     + lambda_moment3_offdiag_eff * moment3_offdiag_loss
                     + moment_inv_loss
+                    + lambda_dist * dist_loss
                 )
 
                 if not total_loss.requires_grad:
@@ -1347,6 +1878,11 @@ def main(cfg_path: str):
             seg_loss_bw_v = float(seg_loss_bw.detach())
             vol_loss_v = float(vol_loss.detach())
             cent_loss_v = float(cent_loss.detach())
+            dist_loss_v = float(dist_loss.detach())
+            if dist_stats is not None:
+                loss_sum_dist += dist_loss_v
+                n_dist += 1
+                dist_last[patch_key] = dist_stats
             avgdist_loss_v = float(avgdist_loss.detach())
             avgdist_axis_loss_v = float(avgdist_axis_loss.detach())
             avgdist_axis_z_v = float(avgdist_axis_stats[0].detach())
@@ -1414,6 +1950,7 @@ def main(cfg_path: str):
             del vol_loss
             del cent_loss
             del avgdist_loss
+            del dist_loss
             del avgdist_axis_loss
             del avgdist_axis_stats
             del moment2_diag_loss
@@ -1549,6 +2086,38 @@ def main(cfg_path: str):
         dices = dices_sum / max(1, n_va_total)
         meanFGDice = float(dices.mean()) if dices is not None else 0.0
 
+        # --- distribution-constraint status ---------------------------------
+        # Logged as signed slack z: z <= 0 satisfied (magnitude = headroom),
+        # z > 0 violated (magnitude = how far outside). Continuous, so a
+        # constraint drifting toward its bound is visible before it crosses.
+        dist_log = {}
+        if matcher is not None and dist_last:
+            n_sat = n_tot = 0
+            for patch, st in dist_last.items():
+                z_mu, z_sd, ratio, act = st["z_mu"], st["z_sd"], st["sd_ratio"], st["active"]
+                for i, c in enumerate(bank_classes):
+                    if i >= z_mu.shape[0]:
+                        break
+                    for gname, sl in DESC_SLICES.items():
+                        a = act[i, sl]
+                        if not bool(a.any()):
+                            continue
+                        dist_log[f"dist/{patch}_zmu_{gname}_c{c}"] = float(z_mu[i, sl][a].max())
+                        dist_log[f"dist/{patch}_zsd_{gname}_c{c}"] = float(z_sd[i, sl][a].max())
+                        dist_log[f"dist/{patch}_sdratio_{gname}_c{c}"] = float(ratio[i, sl][a].mean())
+                n_sat += int((z_mu[act] <= 0).sum() + (z_sd[act] <= 0).sum())
+                n_tot += int(2 * int(act.sum()))
+            dist_log["dist/frac_satisfied"] = n_sat / max(1, n_tot)
+            dist_log["dist/loss"] = loss_sum_dist / max(1, n_dist)
+
+            if is_main and constraint_report_every > 0 and (epoch == 1 or epoch % constraint_report_every == 0):
+                print(f"    [constraints] ep{epoch} satisfied "
+                      f"{n_sat}/{n_tot} ({dist_log['dist/frac_satisfied']:.0%})  "
+                      f"dist_loss={dist_log['dist/loss']:.4f}")
+                for patch in sorted(dist_last):
+                    for line in matcher.report(patch, bank_classes):
+                        print(line)
+
         collapse_log = {}
         if do_collapse:
             if use_ddp:
@@ -1636,6 +2205,7 @@ def main(cfg_path: str):
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
         row.update(collapse_log)
+        row.update(dist_log)
 
         if is_main:
             rows.append(row)
@@ -1711,6 +2281,7 @@ def main(cfg_path: str):
                 "schedule/barrier_t_moment": barrier.t,
                 **viz_log,
                 **collapse_log,
+                **dist_log,
             }, step=epoch)
 
         # periodic checkpoints (rank 0 only)
