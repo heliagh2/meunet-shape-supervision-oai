@@ -208,6 +208,57 @@ def soft_dice_per_class(logits, target, n_classes, ignore_index=-1, eps=1e-6):
     return dice.mean(dim=0).cpu().double().tolist()
 
 
+def descriptor_summary(logits, target, classes, n_classes, ignore_index=-1, eps=1e-6):
+    """
+    Per-sample descriptor values for the predicted and the GT mask, matching what
+    the barriers constrain: volume fraction, normalised centroid and per-axis
+    spread. Diagnostic only — never used for training.
+
+    A bank-target barrier is minimised by predicting the population mean for every
+    case, which satisfies every constraint while reproducing none of the real
+    anatomical variation. Comparing the spread of predicted descriptors against
+    the spread of GT descriptors over the val set makes that collapse visible:
+    a ratio near 1 means the model reproduces population variation, a ratio near
+    0 means it has collapsed onto the mean.
+
+    Returns (pred, gt, present); pred/gt are (B, len(classes), 7) laid out as
+    [frac, cz, cy, cx, sz, sy, sx] and present is (B, len(classes)).
+    """
+    device = logits.device
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index).float().unsqueeze(1)
+    probs = probs * valid
+
+    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
+    one_hot = one_hot.to(device) * valid
+
+    B, _, D, H, W = probs.shape
+    tot = valid.sum(dim=(2, 3, 4)).squeeze(1) + eps  # (B,)
+    grids = [
+        torch.linspace(0, 1, D, device=device).view(1, D, 1, 1),
+        torch.linspace(0, 1, H, device=device).view(1, 1, H, 1),
+        torch.linspace(0, 1, W, device=device).view(1, 1, 1, W),
+    ]
+
+    def summarize(mass):  # mass: (B,D,H,W)
+        m = mass.sum(dim=(1, 2, 3)) + eps
+        vals = [mass.sum(dim=(1, 2, 3)) / tot]
+        cents = [(mass * g).sum(dim=(1, 2, 3)) / m for g in grids]
+        vals += cents
+        for g, c in zip(grids, cents):
+            var = (mass * (g - c.view(-1, 1, 1, 1)) ** 2).sum(dim=(1, 2, 3)) / m
+            vals.append(torch.sqrt(var + eps))
+        return torch.stack(vals, dim=1)  # (B,7)
+
+    preds, gts, present = [], [], []
+    for c in classes:
+        preds.append(summarize(probs[:, c]))
+        gts.append(summarize(one_hot[:, c]))
+        present.append(one_hot[:, c].sum(dim=(1, 2, 3)) > 0)
+
+    return torch.stack(preds, 1), torch.stack(gts, 1), torch.stack(present, 1)
+
+
 def make_loader(cfg, stems, train: bool, sampler=None, fixed_center=None):
     """
     DataLoader for the FIXED 1-STD + 1-EXP patch per case experiment.
@@ -1007,6 +1058,16 @@ def main(cfg_path: str):
                 viz_ready = True
                 print(f"[viz] Tracking patient={viz_stem} slice={viz_slice_idx} (axis={viz_slice_axis})")
 
+    # descriptor-collapse diagnostic (OFF unless the config asks for it): every
+    # Nth validation, compare the spread of PREDICTED descriptors over the val
+    # set against the spread of the GT ones. Set collapse_log_every_n_vals: 5
+    # to enable; 0 or absent keeps the run byte-identical to earlier ones.
+    collapse_every = int(cfg.get("collapse_log_every_n_vals", 0))
+    collapse_classes = list(desc_classes)
+    if is_main and collapse_every > 0:
+        print(f"[collapse] logging predicted-vs-GT descriptor spread every "
+              f"{collapse_every} validations for classes {collapse_classes}")
+
     for epoch in range(1, epochs + 1):
         # linear warmup for moment3 (same ramp applied to diag and off-diag weights)
         if moment3_warmup_end > moment3_warmup_start and epoch <= moment3_warmup_end:
@@ -1436,6 +1497,12 @@ def main(cfg_path: str):
         loss_va_seg = 0.0
         dices_sum = None
         n_va = 0
+        do_collapse = collapse_every > 0 and (epoch == 1 or epoch % collapse_every == 0)
+        if do_collapse:
+            n_cc = len(collapse_classes)
+            col_n = torch.zeros(n_cc, dtype=torch.float64, device=device)
+            col_sum = torch.zeros(2, n_cc, 7, dtype=torch.float64, device=device)
+            col_sq = torch.zeros(2, n_cc, 7, dtype=torch.float64, device=device)
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["std_img"].to(device, non_blocking=True)
@@ -1450,6 +1517,17 @@ def main(cfg_path: str):
                 d = np.array(soft_dice_per_class(logits, y_rs, cfg["n_classes"]))
                 dices_sum = d if dices_sum is None else (dices_sum + d)
                 n_va += 1
+
+                if do_collapse:
+                    p_desc, g_desc, present = descriptor_summary(
+                        logits, y_rs, collapse_classes, cfg["n_classes"]
+                    )
+                    w = present.double().unsqueeze(-1)  # (B,C,1) — skip absent classes
+                    for j, arr in enumerate((p_desc, g_desc)):
+                        a = arr.double()
+                        col_sum[j] += (a * w).sum(dim=0)
+                        col_sq[j] += (a * a * w).sum(dim=0)
+                    col_n += present.double().sum(dim=0)
 
         if dices_sum is None:
             dices_sum = np.zeros(cfg["n_classes"] - 1)
@@ -1470,6 +1548,57 @@ def main(cfg_path: str):
         loss_va_seg = loss_va_seg / max(1, n_va_total) if monitor_seg_loss else 0.0
         dices = dices_sum / max(1, n_va_total)
         meanFGDice = float(dices.mean()) if dices is not None else 0.0
+
+        collapse_log = {}
+        if do_collapse:
+            if use_ddp:
+                dist.all_reduce(col_n, op=dist.ReduceOp.SUM)
+                dist.all_reduce(col_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(col_sq, op=dist.ReduceOp.SUM)
+            n = col_n.clamp(min=1.0).view(1, -1, 1)
+            mean = col_sum / n
+            std = (col_sq / n - mean ** 2).clamp(min=0.0).sqrt()
+            mean_np = mean.cpu().numpy()
+            std_np = std.cpu().numpy()
+            n_np = col_n.cpu().numpy()
+
+            for i, c in enumerate(collapse_classes):
+                if n_np[i] < 2:
+                    continue
+                # volume as RELATIVE spread, so it is directly comparable to the
+                # population figures the bank tolerances were derived from;
+                # centroid/spread are absolute, averaged over the three axes.
+                pv = float(std_np[0, i, 0] / max(mean_np[0, i, 0], 1e-12))
+                gv = float(std_np[1, i, 0] / max(mean_np[1, i, 0], 1e-12))
+                pc = float(std_np[0, i, 1:4].mean())
+                gc = float(std_np[1, i, 1:4].mean())
+                ps = float(std_np[0, i, 4:7].mean())
+                gs = float(std_np[1, i, 4:7].mean())
+                collapse_log.update({
+                    f"collapse/vol_relstd_pred_c{c}": pv,
+                    f"collapse/vol_relstd_gt_c{c}": gv,
+                    f"collapse/cent_std_pred_c{c}": pc,
+                    f"collapse/cent_std_gt_c{c}": gc,
+                    f"collapse/spread_std_pred_c{c}": ps,
+                    f"collapse/spread_std_gt_c{c}": gs,
+                })
+                # A ratio is only meaningful when the GT actually varies across
+                # the val set; emit nothing rather than a 0.0 that would read as
+                # collapse when the denominator is simply degenerate.
+                for key, num, den in (("vol_relstd", pv, gv),
+                                      ("cent_std", pc, gc),
+                                      ("spread_std", ps, gs)):
+                    if den > 1e-8:
+                        collapse_log[f"collapse/{key}_ratio_c{c}"] = num / den
+
+            if is_main and collapse_log:
+                parts = [
+                    f"c{c} vol {collapse_log[f'collapse/vol_relstd_ratio_c{c}']:.2f}"
+                    for c in collapse_classes
+                    if f"collapse/vol_relstd_ratio_c{c}" in collapse_log
+                ]
+                print(f"[collapse] ep{epoch} pred/GT spread ratio (1.0 = no collapse): "
+                      + "  ".join(parts))
 
         row = {
             "epoch": epoch,
@@ -1506,6 +1635,7 @@ def main(cfg_path: str):
         }
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
+        row.update(collapse_log)
 
         if is_main:
             rows.append(row)
@@ -1580,6 +1710,7 @@ def main(cfg_path: str):
                 "schedule/barrier_t_shape": barrier_shape.t,
                 "schedule/barrier_t_moment": barrier.t,
                 **viz_log,
+                **collapse_log,
             }, step=epoch)
 
         # periodic checkpoints (rank 0 only)
