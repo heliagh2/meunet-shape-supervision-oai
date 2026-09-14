@@ -89,10 +89,18 @@ centroid_norm: true             # normalize coords to [0,1]
 
 ##logbarrier toggles
 barrier_t: 5.0
-# per-epoch tightening of the shape barrier (volume/centroid/avgdist/avgdist_axis
-# only — moment2/3/inv stay at fixed barrier_t, see train script comment).
-# Kervadec et al. (1904.04205) style: t <- min(t0 * mu^epoch, t_max).
-barrier_t_mu: 1.01
+# Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
+# It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
+#   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
+#     so a scheduled t makes constraint tightness depend on dataset size.
+#   - the barrier switches to its linear extension when |z| < 1/t^2, and that
+#     threshold moves with t (0.040 at t=5, 0.0056 at t=13.4), so a growing t
+#     changes the loss's CHARACTER mid-run, per class, not just its scale.
+# At the fixed t=5, 1/t^2 = 0.040: every volume constraint (effective tolerance
+# 0.10*gt_frac = 0.0007-0.023) sits in the hinge regime for ALL classes, which
+# at least makes them behave uniformly; centroid and avgdist_axis at tol 0.05
+# sit just inside the log region.
+barrier_t_mu: 1.0
 barrier_t_max: 100.0
 
 volume_tolerance: 0.10
