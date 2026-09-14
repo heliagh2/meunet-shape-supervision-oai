@@ -650,6 +650,7 @@ def compute_volume_barrier(
     eps=1e-6,
     use_bank=None,
     bank_value=None,
+    return_stats=False,
 ):
     """
     Enforce:
@@ -699,7 +700,22 @@ def compute_volume_barrier(
     z_upper = pred_sel - upper   # <= 0 wanted
     z_lower = lower - pred_sel   # <= 0 wanted
 
-    return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
+    loss = barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
+    if not return_stats:
+        return loss
+
+    # Achieved error, RELATIVE, so it is directly comparable to volume_tolerance.
+    # err/tol << 1 means the constraint is satisfied with slack to spare and the
+    # tolerance is doing no work; err/tol > 1 means it is still binding.
+    with torch.no_grad():
+        present = gt_sel > 0
+        rel = (pred_sel - gt_sel).abs() / gt_sel.clamp(min=eps)
+        per_class = torch.where(
+            present.any(dim=0),
+            (rel * present).sum(dim=0) / present.sum(dim=0).clamp(min=1),
+            torch.zeros_like(rel[0]),
+        )
+    return loss, per_class
 
 
 def compute_centroid_barrier(
@@ -714,6 +730,7 @@ def compute_centroid_barrier(
     eps=1e-6,
     use_bank=None,
     bank_value=None,
+    return_stats=False,
 ):
     """
     Enforce:
@@ -769,7 +786,7 @@ def compute_centroid_barrier(
         # a bank-supervised sample is constrained even though its GT is unusable
         has_class = has_class | use_bank
     if not has_class.any():
-        return logits.new_tensor(0.0)
+        return (logits.new_tensor(0.0), logits.new_tensor(0.0)) if return_stats else logits.new_tensor(0.0)
 
     pred_c = pred_centroid[has_class]
     gt_c   = gt_centroid[has_class]
@@ -781,7 +798,12 @@ def compute_centroid_barrier(
     z_upper = pred_c - upper     # <= 0 wanted
     z_lower = lower - pred_c     # <= 0 wanted
 
-    return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
+    loss = barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
+    if not return_stats:
+        return loss
+    with torch.no_grad():
+        err = (pred_c - gt_c).abs().mean()   # patch units, same as centroid_tolerance
+    return loss, err
 
 
 def compute_avgdist_barrier(
@@ -1544,6 +1566,8 @@ def main(cfg_path: str):
         model.train()
         loss_sum_total = 0.0
         loss_sum_dist = 0.0
+        err_sum_vol = {int(c): 0.0 for c in volume_classes}
+        err_sum_cent = {int(c): 0.0 for c in centroid_classes}
         n_dist = 0
         dist_last = {}
         loss_sum_seg_logged = 0.0
@@ -1660,6 +1684,8 @@ def main(cfg_path: str):
                 moment2_err = logits.new_tensor(0.0)
                 moment3_err = logits.new_tensor(0.0)
                 moment_inv_stats = logits.new_zeros(3)  # [err_J1, err_J2, err_J3]
+                vol_errs = logits.new_zeros(len(volume_classes)) if volume_classes else logits.new_zeros(1)
+                cent_errs_per_class = {int(c): logits.new_tensor(0.0) for c in centroid_classes}
                 m2_errs_per_class = {c: logits.new_tensor(0.0) for c in moment2_classes}
                 m3_errs_per_class = {c: logits.new_tensor(0.0) for c in moment3_classes}
                 minv_errs_per_class = {c: logits.new_zeros(3) for c in moment_inv_classes}
@@ -1681,7 +1707,8 @@ def main(cfg_path: str):
 
                 if apply_shape and desc_logits.shape[0] > 0:
                     if lambda_volume > 0.0 and len(volume_classes) > 0:
-                        vol_loss = compute_volume_barrier(
+                        vol_loss, vol_errs = compute_volume_barrier(
+                            return_stats=True,
                             logits=desc_logits,
                             target=desc_lbl,
                             n_classes=cfg["n_classes"],
@@ -1696,8 +1723,8 @@ def main(cfg_path: str):
                     if lambda_centroid > 0.0 and len(centroid_classes) > 0:
                         cents = []
                         for c in centroid_classes:
-                            cents.append(
-                                compute_centroid_barrier(
+                            _cl, _ce = compute_centroid_barrier(
+                                    return_stats=True,
                                     logits=desc_logits,
                                     target=desc_lbl,
                                     n_classes=cfg["n_classes"],
@@ -1708,7 +1735,8 @@ def main(cfg_path: str):
                                     use_bank=use_bank,
                                     bank_value=(bk["cent"][int(c)] if use_bank is not None else None),
                                 )
-                            )
+                            cents.append(_cl)
+                            cent_errs_per_class[int(c)] = _ce
                         cent_loss = torch.stack(cents).mean() if len(cents) > 0 else logits.new_tensor(0.0)
 
                     if lambda_avgdist > 0.0 and len(avgdist_classes) > 0:
@@ -1878,6 +1906,10 @@ def main(cfg_path: str):
             seg_loss_bw_v = float(seg_loss_bw.detach())
             vol_loss_v = float(vol_loss.detach())
             cent_loss_v = float(cent_loss.detach())
+            for _j, _c in enumerate(volume_classes):
+                err_sum_vol[int(_c)] += float(vol_errs[_j].detach())
+            for _c in centroid_classes:
+                err_sum_cent[int(_c)] += float(cent_errs_per_class[int(_c)].detach())
             dist_loss_v = float(dist_loss.detach())
             if dist_stats is not None:
                 loss_sum_dist += dist_loss_v
@@ -2025,6 +2057,8 @@ def main(cfg_path: str):
         loss_tr_moment_inv_J1_err = loss_sum_moment_inv_J1_err / max(1, n_it)
         loss_tr_moment_inv_J2_err = loss_sum_moment_inv_J2_err / max(1, n_it)
         loss_tr_moment_inv_J3_err = loss_sum_moment_inv_J3_err / max(1, n_it)
+        err_tr_vol  = {c: err_sum_vol[c]  / max(1, n_it) for c in err_sum_vol}
+        err_tr_cent = {c: err_sum_cent[c] / max(1, n_it) for c in err_sum_cent}
         loss_tr_moment2_err_per_class   = {c: loss_sum_moment2_err_per_class[c]   / max(1, n_it) for c in moment2_classes}
         loss_tr_moment3_err_per_class   = {c: loss_sum_moment3_err_per_class[c]   / max(1, n_it) for c in moment3_classes}
         loss_tr_moment_inv_err_per_class = {c: loss_sum_moment_inv_err_per_class[c] / max(1, n_it) for c in moment_inv_classes}
@@ -2257,6 +2291,13 @@ def main(cfg_path: str):
                 "desc/minv_err_J2":         loss_tr_moment_inv_J2_err,
                 "desc/minv_err_J3":         loss_tr_moment_inv_J3_err,
                 # per-anatomy moment errors
+                # achieved error vs the tolerance that is being asked for.
+                # ratio << 1 -> the tolerance is loose and the term has stopped
+                # constraining anything; ratio > 1 -> still binding.
+                **{f"desc/vol_err_rel_c{c}": err_tr_vol[c] for c in err_tr_vol},
+                **{f"desc/vol_err_over_tol_c{c}": err_tr_vol[c] / max(volume_tolerance, 1e-12) for c in err_tr_vol},
+                **{f"desc/cent_err_c{c}": err_tr_cent[c] for c in err_tr_cent},
+                **{f"desc/cent_err_over_tol_c{c}": err_tr_cent[c] / max(centroid_tolerance, 1e-12) for c in err_tr_cent},
                 **{f"desc/m2_err_c{c}": loss_tr_moment2_err_per_class[c] for c in moment2_classes},
                 **{f"desc/m3_err_c{c}": loss_tr_moment3_err_per_class[c] for c in moment3_classes},
                 **{f"desc/minv_err_c{c}": loss_tr_moment_inv_err_per_class[c] for c in moment_inv_classes},
@@ -2322,6 +2363,11 @@ def main(cfg_path: str):
                 f"avgdist={loss_tr_avgdist:.4f} "
                 f"avgdist_axis={loss_tr_avgdist_axis:.4f} "
                 f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
+                # achieved error as a multiple of the tolerance being asked for:
+                # <1 satisfied (and <<1 means the tolerance constrains nothing)
+                f"err/tol vol=" + "/".join(f"{err_tr_vol[c] / max(volume_tolerance, 1e-12):.2f}" for c in sorted(err_tr_vol)) + " "
+                f"cent=" + "/".join(f"{err_tr_cent[c] / max(centroid_tolerance, 1e-12):.2f}" for c in sorted(err_tr_cent)) + " "
+                f"axis=" + "/".join(f"{v / max(avgdist_axis_tolerance, 1e-12):.2f}" for v in (loss_tr_avgdist_axis_z, loss_tr_avgdist_axis_y, loss_tr_avgdist_axis_x)) + " | "
                 f"m2={loss_tr_moment2:.4f}(err={loss_tr_moment2_err:.2e}) "
                 f"m3={loss_tr_moment3:.4f}(err={loss_tr_moment3_err:.2e}) "
                 f"minv={loss_tr_moment_inv:.4f}(J1={loss_tr_moment_inv_J1_err:.2e},J2={loss_tr_moment_inv_J2_err:.2e},J3={loss_tr_moment_inv_J3_err:.2e}) | "
