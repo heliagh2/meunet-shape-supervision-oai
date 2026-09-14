@@ -56,6 +56,13 @@ lr: 0.0009
 weight_decay: 1.0e-05
 amp: true
 
+# Matched-compute checkpoint: this arm trains on all 356 cases (356 steps/epoch)
+# while A1.1 trains on 107 (106 steps/epoch), so at epoch 75 this run has taken
+# the same ~26.5k updates A1.1 takes in its full 250. Saves one extra file,
+# checkpoint_budget_best.pt (best val model among epochs <= 75, frozen there);
+# normal checkpointing and early stopping are untouched.
+budget_epoch: 75
+
 epochs: 250
 early_stop_patience: 100
 min_lr: 1.0e-06

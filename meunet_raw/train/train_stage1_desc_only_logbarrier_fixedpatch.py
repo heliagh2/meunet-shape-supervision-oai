@@ -1385,6 +1385,19 @@ def main(cfg_path: str):
     ckpt_every = int(cfg.get("checkpoint_every", 0))
 
     best_metric = -1.0
+
+    # Matched-compute checkpoint. Arms differ in cases, so at the same EPOCH they
+    # have taken different numbers of optimizer steps: 106/epoch at 107 cases vs
+    # 356/epoch at 356. budget_epoch is the epoch at which this run has taken the
+    # same number of steps as the arm it will be compared against; we keep the
+    # best-so-far model up to that point and freeze it there, so the comparison is
+    # best-vs-best under equal compute rather than final-vs-final.
+    budget_epoch = int(cfg.get("budget_epoch", 0))
+    budget_best_metric = -1.0
+    budget_best_epoch = -1
+    if is_main and budget_epoch > 0:
+        print(f"[budget] extra checkpoint: best model among epochs <= {budget_epoch} "
+              f"-> checkpoint_budget_best.pt")
     patience = 0
 
     csv_path = workdir / "progress.csv"
@@ -2348,6 +2361,19 @@ def main(cfg_path: str):
                 torch.save(model_state, workdir / "checkpoint_best.pt")
         else:
             patience += 1
+
+        # frozen once past budget_epoch; never interferes with early stopping
+        if budget_epoch > 0 and epoch <= budget_epoch and metric > budget_best_metric:
+            budget_best_metric = metric
+            budget_best_epoch = epoch
+            if is_main:
+                torch.save(model_state, workdir / "checkpoint_budget_best.pt")
+                with open(workdir / "checkpoint_budget_best.json", "w") as f:
+                    json.dump({"budget_epoch": budget_epoch, "epoch": epoch,
+                               "meanFGDice": float(metric)}, f, indent=2)
+        if is_main and budget_epoch > 0 and epoch == budget_epoch:
+            print(f"[budget] frozen at epoch {budget_epoch}: best was epoch "
+                  f"{budget_best_epoch} with meanFGDice={budget_best_metric:.4f}")
 
         if is_main:
             plot_progress(workdir)

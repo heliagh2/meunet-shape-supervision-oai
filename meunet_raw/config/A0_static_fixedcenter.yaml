@@ -46,6 +46,16 @@ lr: 0.0009
 weight_decay: 1.0e-05
 amp: true
 
+# Matched-compute checkpoint. A1.x takes 106 steps/epoch (107 cases) x 250 =
+# 26,500 steps; A0 takes 356/epoch and reaches the same total at epoch ~74.
+# This saves ONE extra file, checkpoint_budget_best.pt: the best-val model among
+# epochs <= 75, frozen there. Normal checkpoint_best/final are unaffected, and
+# so is early stopping. At that point both arms have taken the same number of
+# updates and seen the same number of patch presentations -- and since each case
+# contributes one FIXED patch reused every epoch, the only remaining difference
+# is 356 distinct patches x 75 repeats vs 107 distinct x 250.
+budget_epoch: 75
+
 epochs: 250
 early_stop_patience: 100
 min_lr: 1.0e-06
