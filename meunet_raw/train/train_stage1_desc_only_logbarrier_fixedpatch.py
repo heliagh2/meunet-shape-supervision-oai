@@ -651,6 +651,7 @@ def compute_volume_barrier(
     use_bank=None,
     bank_value=None,
     return_stats=False,
+    log_space=False,
 ):
     """
     Enforce:
@@ -694,11 +695,33 @@ def compute_volume_barrier(
         gt_sel = torch.where(use_bank.view(-1, 1), bank_sel.expand_as(gt_sel), gt_sel)
 
     vtol = _sample_tol(volume_tolerance, gt_sel.shape[0], device)
-    lower = gt_sel * (1.0 - vtol)
-    upper = gt_sel * (1.0 + vtol)
 
-    z_upper = pred_sel - upper   # <= 0 wanted
-    z_lower = lower - pred_sel   # <= 0 wanted
+    if log_space:
+        # Scale-free form. A RELATIVE band of `tol` becomes an ABSOLUTE band of
+        # log(1+tol) in log space -- identical for every class. The linear form's
+        # band is 0.10*gt_frac, which spans 115x across these classes (0.0002 for
+        # tibial cartilage on the EXP patch up to 0.023 for femoral bone), so it
+        # lands on either side of the barrier's dead-zone threshold 1/t^2 purely
+        # according to how big the structure is. In that dead zone both sides of
+        # the two-sided constraint sit in the linear extension and their
+        # gradients cancel exactly, so the constraint contributes nothing no
+        # matter how wrong it is. Here one t serves every class (live for any
+        # t >= 1/sqrt(log(1+tol)) = 3.2 at tol=0.10).
+        present = gt_sel > 0
+        if not bool(present.any()):
+            zero = logits.new_tensor(0.0)
+            return (zero, logits.new_zeros(len(volume_classes))) if return_stats else zero
+        log_pred = torch.log(pred_sel.clamp(min=eps))
+        log_gt = torch.log(gt_sel.clamp(min=eps))
+        band = torch.log1p(vtol)          # symmetric in log space -> multiplicative
+        z_upper = (log_pred - (log_gt + band))[present]
+        z_lower = ((log_gt - band) - log_pred)[present]
+    else:
+        lower = gt_sel * (1.0 - vtol)
+        upper = gt_sel * (1.0 + vtol)
+
+        z_upper = pred_sel - upper   # <= 0 wanted
+        z_lower = lower - pred_sel   # <= 0 wanted
 
     loss = barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
     if not return_stats:
@@ -1470,6 +1493,14 @@ def main(cfg_path: str):
     # than their own GT: the band has to cover the anatomical spread, not just
     # prediction slack. Default to the GT values so behaviour is unchanged when
     # no population targets are in play.
+    # Constrain log(volume) instead of volume, so the band is the same absolute
+    # size for every class. Off by default: the linear form is what every earlier
+    # run used.
+    volume_log_space = bool(cfg.get("volume_log_space", False))
+    if is_main and volume_log_space:
+        _b = math.log1p(float(cfg.get("volume_tolerance", 0.10)))
+        print(f"[volume] log-space constraint: band = log(1+tol) = {_b:.4f} for every class "
+              f"(dead-zone threshold 1/t^2 = {1.0 / float(cfg.get('barrier_t', 5.0)) ** 2:.5f})")
     bank_volume_tolerance = float(cfg.get("bank_volume_tolerance", cfg.get("volume_tolerance", 0.10)))
     bank_centroid_tolerance = float(cfg.get("bank_centroid_tolerance", cfg.get("centroid_tolerance", 0.05)))
     bank_avgdist_tolerance = float(cfg.get("bank_avgdist_tolerance", cfg.get("avgdist_tolerance", 0.05)))
@@ -1731,6 +1762,7 @@ def main(cfg_path: str):
                             use_bank=use_bank,
                             bank_value=(torch.stack([bk["frac"][int(c)] for c in volume_classes])
                                         if use_bank is not None else None),
+                            log_space=volume_log_space,
                         )
 
                     if lambda_centroid > 0.0 and len(centroid_classes) > 0:

@@ -1,0 +1,131 @@
+# === A1.6: activate the volume constraint by reformulating it ===
+# Identical to A1.1-static in EVERY other respect -- same t=5, same 0.10/0.05/
+# 0.05 tolerances -- so the only variable is how the volume constraint is written.
+# That makes it a clean one-variable test against a run we already have (0.644).
+#
+# Linear form: band = 0.10 * gt_frac, which spans 115x across classes (0.0002 to
+# 0.023) and so falls on either side of the dead-zone threshold 1/t^2 purely
+# according to structure size. At t=5 ALL of them are dead.
+# Log form: band = log(1+0.10) = 0.0953 for every class, a 1x spread, live for
+# any t >= 3.2. One t serves all four classes with no per-class knobs.
+#
+# t stays at 5 deliberately: the log-space loss scales with t (a 3x-too-large
+# class costs ~6 at t=5 but ~73 at t=70), so a high t here would let volume
+# swamp centroid and axis.
+
+# dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
+
+# data
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+# --- weak-annotation ablation ---
+annotated_fraction: 0.3
+annotation_seed: 0
+fixed_center: auto
+
+# constrain log(volume) rather than volume
+volume_log_space: true
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200]
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
+#Exp toggles 
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all classes
+desc_only_classes: [1, 2, 3, 4]
+centroid_classes: [1, 2, 3, 4]
+volume_classes: [1, 2, 3, 4]
+avgdist_classes: [1, 2, 3, 4]
+avgdist_axis_classes: [1, 2, 3, 4]
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 1.0              # small now for first experiment logbarrier
+lambda_centroid: 5.0            # small now for first experiment logbarrier
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
+centroid_norm: true             # normalize coords to [0,1]
+
+##logbarrier toggles
+barrier_t: 5.0
+# Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
+# It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
+#   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
+#     so a scheduled t makes constraint tightness depend on dataset size.
+#   - the barrier switches to its linear extension when |z| < 1/t^2, and that
+#     threshold moves with t (0.040 at t=5, 0.0056 at t=13.4), so a growing t
+#     changes the loss's CHARACTER mid-run, per class, not just its scale.
+# At the fixed t=5, 1/t^2 = 0.040: every volume constraint (effective tolerance
+# 0.10*gt_frac = 0.0007-0.023) sits in the hinge regime for ALL classes, which
+# at least makes them behave uniformly; centroid and avgdist_axis at tol 0.05
+# sit just inside the log region.
+barrier_t_mu: 1.0
+barrier_t_max: 100.0
+
+volume_tolerance: 0.10
+centroid_tolerance: 0.05
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.05
+
+lambda_moment2: 0.0      # 6 covariance components
+lambda_moment3: 0.0       # 10 skewness components, target weight once fully warmed up
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
+#lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
+
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 0.05
+moment3_tolerance: 0.01  # updated according to values
+moment_inv_tolerance: 0.01
+
+lambda_moment_inv_J1: 0.0       # disable J1
+lambda_moment_inv_J2: 0.0
+lambda_moment_inv_J3: 0.0
+moment_inv_J1_tolerance: 0.01
+moment_inv_J2_tolerance: 5.0e-4
+moment_inv_J3_tolerance: 1.0e-5
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: A1.6_logvolume
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A1_6_logvolume
