@@ -114,5 +114,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: A1.0_subset30_gtcenter
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A1_0_subset30_gtcenter
+wandb_run_name: A1.0_subset30_gtcenter_fixed_t
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A1_0_subset30_gtcenter_fixed_t
