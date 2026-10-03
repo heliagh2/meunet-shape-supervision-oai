@@ -248,6 +248,33 @@ def predicted_descriptors(logits, classes, eps=1e-6):
     return torch.stack([mass_descriptors(probs[:, c], tot, eps) for c in classes], dim=1)
 
 
+def constraint_satisfaction(pred, gt, present, vol_tol, cent_tol, axis_tol):
+    """
+    Per-constraint satisfaction, computed directly from the constraint
+    definitions rather than from the barrier -- so it is independent of t, of the
+    dead zone, and of whatever the barrier happens to return.
+
+        volume    satisfied iff |pred_frac - gt_frac| <= vol_tol * gt_frac   (relative)
+        centroid  satisfied iff |pred_c - gt_c|       <= cent_tol            (absolute)
+        spread    satisfied iff |pred_s - gt_s|       <= axis_tol            (absolute)
+
+    pred/gt are (B, C, 7) from descriptor_summary, present is (B, C).
+    Returns {group: (sat_count_per_class, total_per_class)} as float tensors of
+    shape (C,), so an epoch can be accumulated by summing.
+    """
+    out = {}
+    w = present.float()                                  # (B,C)
+    for name, sl in DESC_SLICES.items():
+        d = (pred[:, :, sl] - gt[:, :, sl]).abs()        # (B,C,k)
+        if name == "volume":
+            lim = vol_tol * gt[:, :, sl].abs()
+        else:
+            lim = torch.full_like(d, cent_tol if name == "centroid" else axis_tol)
+        ok = (d <= lim).float() * w.unsqueeze(-1)
+        out[name] = (ok.sum(dim=(0, 2)), w.sum(dim=0) * d.shape[-1])
+    return out
+
+
 def descriptor_summary(logits, target, classes, n_classes, ignore_index=-1, eps=1e-6):
     """
     Per-sample descriptor values for the predicted and the GT mask, matching what
@@ -1496,6 +1523,12 @@ def main(cfg_path: str):
     # Constrain log(volume) instead of volume, so the band is the same absolute
     # size for every class. Off by default: the linear form is what every earlier
     # run used.
+    # Constraint-satisfaction tracking (Kervadec-style): the fraction of
+    # constraints actually met, measured from the constraint definitions rather
+    # than from the barrier value -- the barrier is dominated by a constant
+    # offset and goes blind inside its dead zone, so it cannot report this.
+    # Computed under no_grad on every Nth train batch; 0 disables.
+    sat_every_n_steps = int(cfg.get("constraint_sat_every_n_steps", 10))
     volume_log_space = bool(cfg.get("volume_log_space", False))
     if is_main and volume_log_space:
         _b = math.log1p(float(cfg.get("volume_tolerance", 0.10)))
@@ -1610,6 +1643,10 @@ def main(cfg_path: str):
         model.train()
         loss_sum_total = 0.0
         loss_sum_dist = 0.0
+        sat_ok = {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
+                  for g in DESC_SLICES}
+        sat_tot = {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
+                   for g in DESC_SLICES}
         err_sum_vol = {int(c): 0.0 for c in volume_classes}
         err_sum_cent = {int(c): 0.0 for c in centroid_classes}
         n_dist = 0
@@ -1714,6 +1751,18 @@ def main(cfg_path: str):
                     (shape_on == "exp" and expanded) or
                     (shape_on == "both")
                 )
+
+                if sat_every_n_steps > 0 and (i % sat_every_n_steps == 0) and apply_shape:
+                    with torch.no_grad():
+                        _sl = desc_logits if desc_logits.shape[0] > 0 else None
+                        if _sl is not None:
+                            _p, _g, _pr = descriptor_summary(
+                                _sl, desc_lbl, bank_classes, cfg["n_classes"])
+                            for _grp, (_ok, _tt) in constraint_satisfaction(
+                                    _p, _g, _pr, volume_tolerance,
+                                    centroid_tolerance, avgdist_axis_tolerance).items():
+                                sat_ok[_grp] += _ok.double()
+                                sat_tot[_grp] += _tt.double()
 
                 vol_loss = logits.new_tensor(0.0)
                 cent_loss = logits.new_tensor(0.0)
@@ -2165,6 +2214,34 @@ def main(cfg_path: str):
         dices = dices_sum / max(1, n_va_total)
         meanFGDice = float(dices.mean()) if dices is not None else 0.0
 
+        # --- constraint satisfaction (per group, per class, overall) ---------
+        sat_log = {}
+        if sat_every_n_steps > 0:
+            if use_ddp:
+                for _g in DESC_SLICES:
+                    dist.all_reduce(sat_ok[_g], op=dist.ReduceOp.SUM)
+                    dist.all_reduce(sat_tot[_g], op=dist.ReduceOp.SUM)
+            _all_ok = _all_tot = 0.0
+            for _g in DESC_SLICES:
+                ok, tot = sat_ok[_g], sat_tot[_g]
+                for _i, _c in enumerate(bank_classes):
+                    if float(tot[_i]) > 0:
+                        sat_log[f"sat/{_g}_c{_c}"] = float(ok[_i] / tot[_i])
+                if float(tot.sum()) > 0:
+                    sat_log[f"sat/{_g}"] = float(ok.sum() / tot.sum())
+                _all_ok += float(ok.sum()); _all_tot += float(tot.sum())
+            if _all_tot > 0:
+                sat_log["sat/overall"] = _all_ok / _all_tot
+
+            if is_main and constraint_report_every > 0 and (epoch == 1 or epoch % constraint_report_every == 0):
+                parts = []
+                for _g in DESC_SLICES:
+                    per_c = "/".join(
+                        f"{sat_log.get(f'sat/{_g}_c{_c}', float('nan')):.2f}" for _c in bank_classes)
+                    parts.append(f"{_g}={sat_log.get(f'sat/{_g}', float('nan')):.2f} [{per_c}]")
+                print(f"    [satisfied] ep{epoch} overall={sat_log.get('sat/overall', float('nan')):.2f}  "
+                      + "  ".join(parts))
+
         # --- distribution-constraint status ---------------------------------
         # Logged as signed slack z: z <= 0 satisfied (magnitude = headroom),
         # z > 0 violated (magnitude = how far outside). Continuous, so a
@@ -2285,6 +2362,7 @@ def main(cfg_path: str):
             row[f"dice_c{k}"] = float(d)
         row.update(collapse_log)
         row.update(dist_log)
+        row.update(sat_log)
 
         if is_main:
             rows.append(row)
@@ -2343,6 +2421,17 @@ def main(cfg_path: str):
                 **{f"desc/vol_err_over_tol_c{c}": err_tr_vol[c] / max(volume_tolerance, 1e-12) for c in err_tr_vol},
                 **{f"desc/cent_err_c{c}": err_tr_cent[c] for c in err_tr_cent},
                 **{f"desc/cent_err_over_tol_c{c}": err_tr_cent[c] / max(centroid_tolerance, 1e-12) for c in err_tr_cent},
+                # The barrier itself, as flat series, so wandb can overlay them on
+                # the error panels: a descriptor is inside its constraint while its
+                # curve sits below the matching tolerance line, and err_over_tol
+                # panels cross their barrier at desc/threshold = 1.
+                "desc/threshold":        1.0,
+                "desc/tol_volume":       volume_tolerance,
+                "desc/tol_centroid":     centroid_tolerance,
+                "desc/tol_avgdist_axis": avgdist_axis_tolerance,
+                # achieved error in the SAME units as the tolerance above
+                **{f"desc/axis_err_{ax}": v for ax, v in
+                   zip("zyx", (loss_tr_avgdist_axis_z, loss_tr_avgdist_axis_y, loss_tr_avgdist_axis_x))},
                 **{f"desc/m2_err_c{c}": loss_tr_moment2_err_per_class[c] for c in moment2_classes},
                 **{f"desc/m3_err_c{c}": loss_tr_moment3_err_per_class[c] for c in moment3_classes},
                 **{f"desc/minv_err_c{c}": loss_tr_moment_inv_err_per_class[c] for c in moment_inv_classes},
@@ -2368,6 +2457,7 @@ def main(cfg_path: str):
                 **viz_log,
                 **collapse_log,
                 **dist_log,
+                **sat_log,
             }, step=epoch)
 
         # periodic checkpoints (rank 0 only)
