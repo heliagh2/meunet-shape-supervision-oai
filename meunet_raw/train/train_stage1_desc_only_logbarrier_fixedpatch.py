@@ -267,7 +267,9 @@ def constraint_satisfaction(pred, gt, present, vol_tol, cent_tol, axis_tol):
     for name, sl in DESC_SLICES.items():
         d = (pred[:, :, sl] - gt[:, :, sl]).abs()        # (B,C,k)
         if name == "volume":
-            lim = vol_tol * gt[:, :, sl].abs()
+            vt = (torch.tensor(vol_tol, device=gt.device, dtype=gt.dtype).view(1, -1, 1)
+                  if isinstance(vol_tol, (list, tuple)) else vol_tol)
+            lim = vt * gt[:, :, sl].abs()
         else:
             lim = torch.full_like(d, cent_tol if name == "centroid" else axis_tol)
         ok = (d <= lim).float() * w.unsqueeze(-1)
@@ -636,6 +638,34 @@ class LogBarrierLoss:
 
 # descriptor constraints via log barrier
 
+def _normalize_z(z_upper, z_lower, tau, enabled, eps=1e-12):
+    """
+    Express the constraint violation in units of its own tolerance.
+
+    Raw z is in descriptor units, so tau varies 115x across these classes
+    (0.0002 for tibial cartilage on EXP, 0.023 for femoral bone) and the
+    barrier's log/linear handover at |z| = 1/t^2 therefore lands differently for
+    each one. When tau < 1/t^2 BOTH sides fall in the linear extension, their
+    slopes (+t and -t) cancel exactly, and the constraint contributes no gradient
+    however wrong it is -- at t=5 that blind spot was 39x the size of tibial
+    cartilage itself.
+
+    Dividing by tau fixes it structurally rather than by tuning:
+      - the two sides then sum to exactly -2 instead of -2*tau, so a dead zone
+        would need 2 < 2/t^2, i.e. t < 1. It cannot occur for any usable t,
+        any class, any tolerance.
+      - a perfect prediction puts both sides at -1, so the barrier returns
+        exactly 0 -- the large constant floor disappears and the logged loss
+        becomes readable as "how violated".
+      - t becomes a pure sharpness knob, no longer coupled to how big the
+        smallest structure happens to be.
+    """
+    if not enabled:
+        return z_upper, z_lower
+    tau = tau.clamp(min=eps) if torch.is_tensor(tau) else max(float(tau), eps)
+    return z_upper / tau, z_lower / tau
+
+
 def _sample_tol(tol, B, device):
     """
     Tolerance as a per-sample (B,1) tensor.
@@ -645,6 +675,11 @@ def _sample_tol(tol, B, device):
     anatomical spread). A single scalar would hand the bank-supervised cases an
     infeasible constraint, so the caller may pass a per-sample vector instead.
     """
+    if isinstance(tol, (list, tuple)):
+        # per-CLASS tolerance: one value per constrained class, broadcast over
+        # the batch. Lets the thin structures have a band they can actually meet
+        # while the bones keep a tight one.
+        return torch.tensor([float(v) for v in tol], device=device, dtype=torch.float32).view(1, -1)
     if torch.is_tensor(tol):
         return tol.to(device=device, dtype=torch.float32).view(-1, 1)
     return torch.full((B, 1), float(tol), device=device, dtype=torch.float32)
@@ -679,6 +714,7 @@ def compute_volume_barrier(
     bank_value=None,
     return_stats=False,
     log_space=False,
+    normalize=False,
 ):
     """
     Enforce:
@@ -743,12 +779,14 @@ def compute_volume_barrier(
         band = torch.log1p(vtol)          # symmetric in log space -> multiplicative
         z_upper = (log_pred - (log_gt + band))[present]
         z_lower = ((log_gt - band) - log_pred)[present]
+        z_upper, z_lower = _normalize_z(z_upper, z_lower, band.expand_as(present)[present], normalize)
     else:
         lower = gt_sel * (1.0 - vtol)
         upper = gt_sel * (1.0 + vtol)
 
         z_upper = pred_sel - upper   # <= 0 wanted
         z_lower = lower - pred_sel   # <= 0 wanted
+        z_upper, z_lower = _normalize_z(z_upper, z_lower, vtol * gt_sel.abs(), normalize)
 
     loss = barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
     if not return_stats:
@@ -781,6 +819,7 @@ def compute_centroid_barrier(
     use_bank=None,
     bank_value=None,
     return_stats=False,
+    normalize=False,
 ):
     """
     Enforce:
@@ -847,6 +886,7 @@ def compute_centroid_barrier(
 
     z_upper = pred_c - upper     # <= 0 wanted
     z_lower = lower - pred_c     # <= 0 wanted
+    z_upper, z_lower = _normalize_z(z_upper, z_lower, ctol, normalize)
 
     loss = barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
     if not return_stats:
@@ -868,6 +908,7 @@ def compute_avgdist_barrier(
     eps=1e-6,
     use_bank=None,
     bank_value=None,
+    normalize=False,
 ):
     """
     Enforce:
@@ -937,6 +978,7 @@ def compute_avgdist_barrier(
 
     z_upper = pred_d - upper
     z_lower = lower - pred_d
+    z_upper, z_lower = _normalize_z(z_upper, z_lower, dtol, normalize)
 
     return barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
 
@@ -954,6 +996,7 @@ def compute_avgdist_axis_barrier(
     return_stats=False,
     use_bank=None,
     bank_value=None,
+    normalize=False,
 ):
     """
     Enforce:
@@ -1018,6 +1061,7 @@ def compute_avgdist_axis_barrier(
 
         z_upper = pred_s - upper
         z_lower = lower - pred_s
+        z_upper, z_lower = _normalize_z(z_upper, z_lower, atol, normalize)
         barrier_loss = barrier_loss + barrier(z_upper.reshape(-1)) + barrier(z_lower.reshape(-1))
 
         if return_stats:
@@ -1338,7 +1382,9 @@ def main(cfg_path: str):
     # rather than meaningfully tighten a log-region cutoff they never reach.
     barrier_t_mu = float(cfg.get("barrier_t_mu", 1.0))     # 1.0 = no growth (backward compatible)
     barrier_t_max = float(cfg.get("barrier_t_max", 100.0))
-    volume_tolerance = float(cfg.get("volume_tolerance", 0.10))
+    # scalar, or one value per entry of volume_classes
+    _vt = cfg.get("volume_tolerance", 0.10)
+    volume_tolerance = [float(v) for v in _vt] if isinstance(_vt, (list, tuple)) else float(_vt)
     centroid_tolerance = float(cfg.get("centroid_tolerance", 0.05))
     avgdist_tolerance = float(cfg.get("avgdist_tolerance", 0.05))
     avgdist_axis_tolerance = float(cfg.get("avgdist_axis_tolerance", 0.05))
@@ -1529,12 +1575,35 @@ def main(cfg_path: str):
     # offset and goes blind inside its dead zone, so it cannot report this.
     # Computed under no_grad on every Nth train batch; 0 disables.
     sat_every_n_steps = int(cfg.get("constraint_sat_every_n_steps", 10))
+    # Express every constraint violation in units of its own tolerance. Removes
+    # the dead zone structurally and makes a satisfied term contribute exactly 0.
+    constraint_normalize = bool(cfg.get("constraint_normalize", False))
     volume_log_space = bool(cfg.get("volume_log_space", False))
     if is_main and volume_log_space:
-        _b = math.log1p(float(cfg.get("volume_tolerance", 0.10)))
+        _b = math.log1p(volume_tolerance if not isinstance(volume_tolerance, list)
+                        else float(np.mean(volume_tolerance)))
         print(f"[volume] log-space constraint: band = log(1+tol) = {_b:.4f} for every class "
               f"(dead-zone threshold 1/t^2 = {1.0 / float(cfg.get('barrier_t', 5.0)) ** 2:.5f})")
-    bank_volume_tolerance = float(cfg.get("bank_volume_tolerance", cfg.get("volume_tolerance", 0.10)))
+    bank_volume_tolerance = float(cfg.get("bank_volume_tolerance", 0.10
+                                           if isinstance(volume_tolerance, list) else volume_tolerance))
+    if isinstance(volume_tolerance, list):
+        if len(volume_tolerance) != len(volume_classes):
+            raise ValueError(f"volume_tolerance has {len(volume_tolerance)} entries but "
+                             f"volume_classes has {len(volume_classes)}")
+        if volume_log_space:
+            raise NotImplementedError("per-class volume_tolerance with volume_log_space: the log "
+                                      "band is already class-independent, so a per-class list is "
+                                      "redundant there.")
+        if unannotated_mode == "bank" or bank_targets != "none":
+            raise NotImplementedError("per-class volume_tolerance with population targets: the "
+                                      "per-sample GT/bank tolerance mix expects a scalar.")
+    # class -> its volume tolerance, for logging and the satisfaction metric
+    vol_tol_by_class = {int(c): (volume_tolerance[i] if isinstance(volume_tolerance, list)
+                                 else volume_tolerance)
+                        for i, c in enumerate(volume_classes)}
+    if is_main:
+        print(f"[tolerance] volume={volume_tolerance} centroid={centroid_tolerance} "
+              f"avgdist_axis={avgdist_axis_tolerance} normalize={constraint_normalize}")
     bank_centroid_tolerance = float(cfg.get("bank_centroid_tolerance", cfg.get("centroid_tolerance", 0.05)))
     bank_avgdist_tolerance = float(cfg.get("bank_avgdist_tolerance", cfg.get("avgdist_tolerance", 0.05)))
     bank_avgdist_axis_tolerance = float(cfg.get("bank_avgdist_axis_tolerance", cfg.get("avgdist_axis_tolerance", 0.05)))
@@ -1643,6 +1712,8 @@ def main(cfg_path: str):
         model.train()
         loss_sum_total = 0.0
         loss_sum_dist = 0.0
+        grad_norm_sum = 0.0
+        grad_clipped = 0.0
         sat_ok = {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
                   for g in DESC_SLICES}
         sat_tot = {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
@@ -1759,7 +1830,8 @@ def main(cfg_path: str):
                             _p, _g, _pr = descriptor_summary(
                                 _sl, desc_lbl, bank_classes, cfg["n_classes"])
                             for _grp, (_ok, _tt) in constraint_satisfaction(
-                                    _p, _g, _pr, volume_tolerance,
+                                    _p, _g, _pr,
+                                    [vol_tol_by_class.get(int(_c), float('inf')) for _c in bank_classes],
                                     centroid_tolerance, avgdist_axis_tolerance).items():
                                 sat_ok[_grp] += _ok.double()
                                 sat_tot[_grp] += _tt.double()
@@ -1812,6 +1884,7 @@ def main(cfg_path: str):
                             bank_value=(torch.stack([bk["frac"][int(c)] for c in volume_classes])
                                         if use_bank is not None else None),
                             log_space=volume_log_space,
+                            normalize=constraint_normalize,
                         )
 
                     if lambda_centroid > 0.0 and len(centroid_classes) > 0:
@@ -1828,6 +1901,7 @@ def main(cfg_path: str):
                                     centroid_norm=centroid_norm,
                                     use_bank=use_bank,
                                     bank_value=(bk["cent"][int(c)] if use_bank is not None else None),
+                                    normalize=constraint_normalize,
                                 )
                             cents.append(_cl)
                             cent_errs_per_class[int(c)] = _ce
@@ -1847,6 +1921,7 @@ def main(cfg_path: str):
                                     centroid_norm=centroid_norm,
                                     use_bank=use_bank,
                                     bank_value=(bk["avgdist"][int(c)] if use_bank is not None else None),
+                                    normalize=constraint_normalize,
                                 )
                             )
                         avgdist_loss = torch.stack(avgdists).mean() if len(avgdists) > 0 else logits.new_tensor(0.0)
@@ -1866,6 +1941,7 @@ def main(cfg_path: str):
                                     return_stats=True,
                                     use_bank=use_bank,
                                     bank_value=(bk["spread"][int(c)] if use_bank is not None else None),
+                                    normalize=constraint_normalize,
                                 )
                             avgdist_axes.append(axis_loss_c)
                             avgdist_axis_stats_all.append(axis_stats_c)
@@ -1991,7 +2067,14 @@ def main(cfg_path: str):
 
             scaler.scale(total_loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg.get("grad_clip", 5.0)))
+            _gclip = float(cfg.get("grad_clip", 5.0))
+            # clip_grad_norm_ returns the norm BEFORE clipping, so this is free.
+            # If the clip fires on most steps the effective step size is set by the
+            # clip rather than by lr -- direction is preserved but lr stops meaning
+            # what it says, which matters now that normalisation raised the scale.
+            _gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=_gclip))
+            grad_norm_sum += _gn
+            grad_clipped += 1.0 if _gn > _gclip else 0.0
             scaler.step(opt)
             scaler.update()
 
@@ -2344,7 +2427,8 @@ def main(cfg_path: str):
             "monitor_seg_loss": int(monitor_seg_loss),
             "barrier_t_shape": barrier_shape.t,
             "barrier_t_moment": barrier.t,
-            "volume_tolerance": volume_tolerance,
+            "volume_tolerance": (str(volume_tolerance) if isinstance(volume_tolerance, list)
+                                 else volume_tolerance),
             "centroid_tolerance": centroid_tolerance,
             "avgdist_tolerance": avgdist_tolerance,
             "avgdist_axis_tolerance": avgdist_axis_tolerance,
@@ -2363,6 +2447,24 @@ def main(cfg_path: str):
         row.update(collapse_log)
         row.update(dist_log)
         row.update(sat_log)
+
+        # Weighted share each descriptor takes of the total. Normalisation changed
+        # every term's scale, so the lambda balance that was tuned against the old
+        # scales no longer necessarily holds -- this is the direct read on it.
+        _contribs = {
+            "vol": lambda_volume * loss_tr_vol,
+            "cent": lambda_centroid * loss_tr_cent,
+            "avgdist": lambda_avgdist * loss_tr_avgdist,
+            "avgdist_axis": lambda_avgdist_axis * loss_tr_avgdist_axis,
+            "m2": lambda_moment2 * loss_tr_moment2,
+            "m3": lambda_moment3_eff * loss_tr_moment3,
+            "minv": loss_tr_moment_inv,
+        }
+        _contrib_tot = sum(_contribs.values())
+        _share = {f"contrib_frac/{k}": v / max(_contrib_tot, 1e-12) for k, v in _contribs.items()}
+        _gstats = {"train/grad_norm": grad_norm_sum / max(1, n_it),
+                   "train/grad_clip_frac": grad_clipped / max(1, n_it)}
+        row.update(_share); row.update(_gstats)
 
         if is_main:
             rows.append(row)
@@ -2418,7 +2520,7 @@ def main(cfg_path: str):
                 # ratio << 1 -> the tolerance is loose and the term has stopped
                 # constraining anything; ratio > 1 -> still binding.
                 **{f"desc/vol_err_rel_c{c}": err_tr_vol[c] for c in err_tr_vol},
-                **{f"desc/vol_err_over_tol_c{c}": err_tr_vol[c] / max(volume_tolerance, 1e-12) for c in err_tr_vol},
+                **{f"desc/vol_err_over_tol_c{c}": err_tr_vol[c] / max(vol_tol_by_class[c], 1e-12) for c in err_tr_vol},
                 **{f"desc/cent_err_c{c}": err_tr_cent[c] for c in err_tr_cent},
                 **{f"desc/cent_err_over_tol_c{c}": err_tr_cent[c] / max(centroid_tolerance, 1e-12) for c in err_tr_cent},
                 # The barrier itself, as flat series, so wandb can overlay them on
@@ -2426,7 +2528,8 @@ def main(cfg_path: str):
                 # curve sits below the matching tolerance line, and err_over_tol
                 # panels cross their barrier at desc/threshold = 1.
                 "desc/threshold":        1.0,
-                "desc/tol_volume":       volume_tolerance,
+                **({f"desc/tol_volume_c{c}": v for c, v in vol_tol_by_class.items()}
+                   if isinstance(volume_tolerance, list) else {"desc/tol_volume": volume_tolerance}),
                 "desc/tol_centroid":     centroid_tolerance,
                 "desc/tol_avgdist_axis": avgdist_axis_tolerance,
                 # achieved error in the SAME units as the tolerance above
@@ -2436,6 +2539,8 @@ def main(cfg_path: str):
                 **{f"desc/m3_err_c{c}": loss_tr_moment3_err_per_class[c] for c in moment3_classes},
                 **{f"desc/minv_err_c{c}": loss_tr_moment_inv_err_per_class[c] for c in moment_inv_classes},
                 # weighted contributions (lambda × barrier) — what drives the gradient
+                **_share,
+                **_gstats,
                 "contrib/vol":          lambda_volume    * loss_tr_vol,
                 "contrib/cent":         lambda_centroid  * loss_tr_cent,
                 "contrib/avgdist":      lambda_avgdist   * loss_tr_avgdist,
@@ -2513,7 +2618,11 @@ def main(cfg_path: str):
                 f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
                 # achieved error as a multiple of the tolerance being asked for:
                 # <1 satisfied (and <<1 means the tolerance constrains nothing)
-                f"err/tol vol=" + "/".join(f"{err_tr_vol[c] / max(volume_tolerance, 1e-12):.2f}" for c in sorted(err_tr_vol)) + " "
+                f"share vol={_contribs['vol'] / max(_contrib_tot, 1e-12):.2f} "
+                f"cent={_contribs['cent'] / max(_contrib_tot, 1e-12):.2f} "
+                f"axis={_contribs['avgdist_axis'] / max(_contrib_tot, 1e-12):.2f} | "
+                f"gnorm={grad_norm_sum / max(1, n_it):.2f} clip={grad_clipped / max(1, n_it):.0%} | "
+                f"err/tol vol=" + "/".join(f"{err_tr_vol[c] / max(vol_tol_by_class[c], 1e-12):.2f}" for c in sorted(err_tr_vol)) + " "
                 f"cent=" + "/".join(f"{err_tr_cent[c] / max(centroid_tolerance, 1e-12):.2f}" for c in sorted(err_tr_cent)) + " "
                 f"axis=" + "/".join(f"{v / max(avgdist_axis_tolerance, 1e-12):.2f}" for v in (loss_tr_avgdist_axis_z, loss_tr_avgdist_axis_y, loss_tr_avgdist_axis_x)) + " | "
                 f"m2={loss_tr_moment2:.4f}(err={loss_tr_moment2_err:.2e}) "
