@@ -169,6 +169,57 @@ def build_viz_wandb_image(img_slice, gt_slice, pred_slice, class_names):
     return wandb.Image(out)
 
 
+def build_prob_wandb_image(img_slice, gt_slice, prob_slices, class_names, stats=None):
+    """
+    Per-class probability heat map on a FIXED 0..1 colour scale, GT outlined on top.
+
+    The fixed scale is the entire point. Auto-scaling (matplotlib's default)
+    stretches a fog peaking at 0.25 to full brightness and draws it as a crisp
+    structure, which is exactly the failure this panel exists to expose. With
+    vmin/vmax pinned, a diffuse map reads as uniformly dim and a converged one as
+    near-white, so softness is visible at a glance instead of inferred from a curve.
+
+    prob_slices: {class index: (H,W) float array of p_c}, already at the same
+    resolution and slice as img_slice/gt_slice.
+    """
+    img = np.asarray(img_slice, dtype=np.float32)
+    lo, hi = float(img.min()), float(img.max())
+    img = (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
+    gt_slice = np.asarray(gt_slice)
+
+    items = list(prob_slices.items())
+    ncol = len(items) + 1
+    fig, axes = plt.subplots(1, ncol, figsize=(3.0 * ncol, 3.4), dpi=120)
+    axes = np.atleast_1d(axes)
+    axes[0].imshow(img, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("scan", fontsize=9)
+    axes[0].set_axis_off()
+
+    im = None
+    for ax, (c, pmap) in zip(axes[1:], items):
+        # vmin/vmax pinned -- never pass this through a normaliser
+        im = ax.imshow(np.asarray(pmap, dtype=np.float32), cmap="magma", vmin=0.0, vmax=1.0)
+        m = (gt_slice == int(c))
+        if m.any():
+            ax.contour(m.astype(np.float32), levels=[0.5], colors="#00e5ff", linewidths=0.7)
+        title = f"p[{class_names.get(int(c), str(c))}]"
+        if stats and int(c) in stats:
+            title += f"\n{stats[int(c)]}"
+        ax.set_title(title, fontsize=8)
+        ax.set_axis_off()
+
+    if im is not None:
+        cb = fig.colorbar(im, ax=axes.tolist(), fraction=0.025, pad=0.01)
+        cb.set_ticks([0.0, 0.25, 0.5, 0.75, 1.0])
+        cb.ax.tick_params(labelsize=7)
+
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    out = rgba[..., :3].copy()
+    plt.close(fig)
+    return wandb.Image(out)
+
+
 def one_hot_labels(target, n_classes, ignore_index=-1):
     """
     target: (B,Z,Y,X) int with possible -1
@@ -209,6 +260,14 @@ def soft_dice_per_class(logits, target, n_classes, ignore_index=-1, eps=1e-6):
 
 
 DESC_SLICES = {"volume": slice(0, 1), "centroid": slice(1, 4), "spread": slice(4, 7)}
+
+# The two patch branches every per-step metric is accumulated under. With
+# shape_on="both" the STD and EXP steps alternate, and they are not two views of
+# one constraint: different crop, different supervision resolution (logit1 vs
+# logit2), and -- for the absolute centroid/spread tolerances -- a different
+# physical band, since the same normalised tolerance spans 1.9x more anatomy on
+# EXP for the two in-plane axes. Blending them into one number hides that.
+PATCH_KEYS = ("std", "exp")
 
 
 def mass_descriptors(mass, tot, eps=1e-6):
@@ -310,6 +369,46 @@ def descriptor_summary(logits, target, classes, n_classes, ignore_index=-1, eps=
         present.append(one_hot[:, c].sum(dim=(1, 2, 3)) > 0)
 
     return torch.stack(preds, 1), torch.stack(gts, 1), torch.stack(present, 1)
+
+
+@torch.no_grad()
+def softness_summary(logits, target, classes, n_classes, ignore_index=-1, eps=1e-6):
+    """
+    How peaked each class's probability map is, against how peaked it must be for
+    the soft descriptors to mean what the hard evaluation measures.
+
+    The barriers see sum(p_c); evaluation sees #(argmax == c). Those agree only
+    when p is near 0/1. A diffuse map can hit a volume target exactly while winning
+    argmax nowhere -- soft_frac on target, hard_frac ~ 0 -- and no barrier on
+    sum(p_c) can tell the difference. Logging both makes it directly visible.
+
+    Returns (len(classes), 4): [soft_frac, hard_frac, mean_p_inside_gt, gt_frac],
+    averaged over the batch. The fracs are over VALID voxels, so soft_frac and
+    gt_frac are on the same footing as the volume descriptor itself.
+    """
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index)
+    vf = valid.float()
+    hard = probs.argmax(dim=1)
+    one_hot, _ = one_hot_labels(target, n_classes, ignore_index)
+    tot = vf.sum(dim=(1, 2, 3)) + eps                      # (B,)
+
+    rows = []
+    for c in classes:
+        pc = probs[:, int(c)] * vf
+        gc = one_hot[:, int(c)]
+        gm = gc.sum(dim=(1, 2, 3))                         # GT voxels per sample
+        soft_frac = (pc.sum(dim=(1, 2, 3)) / tot).mean()
+        hard_frac = (((hard == int(c)) & valid).float().sum(dim=(1, 2, 3)) / tot).mean()
+        # averaged only over samples that actually contain the class -- including
+        # absent ones would drag this toward 0 and look like fog
+        present = gm > 0
+        if bool(present.any()):
+            mean_in = ((pc * gc).sum(dim=(1, 2, 3)) / gm.clamp(min=eps))[present].mean()
+        else:
+            mean_in = logits.new_tensor(0.0)
+        rows.append(torch.stack([soft_frac, hard_frac, mean_in, (gm / tot).mean()]))
+    return torch.stack(rows, 0).double()
 
 
 def label_descriptors(lbl, classes, eps=1e-6):
@@ -1513,6 +1612,11 @@ def main(cfg_path: str):
     viz_cartilage_classes = as_int_list(cfg.get("viz_cartilage_classes", moment2_classes), default=moment2_classes)
     viz_min_cartilage_pixels = int(cfg.get("viz_min_cartilage_pixels", 1))
     viz_slice_axis = int(cfg.get("viz_slice_axis", 0))
+    # Probability maps default to the cartilage classes only -- those are the thin
+    # ones where diffuseness actually matters, and one panel per class keeps the
+    # figure readable. Set viz_prob_classes: [] to turn the panel off.
+    viz_prob_classes = as_int_list(cfg.get("viz_prob_classes", viz_cartilage_classes),
+                                   default=viz_cartilage_classes)
     viz_class_names = {int(k): v for k, v in cfg.get("viz_class_names", {
         0: "background", 1: "femur", 2: "femoral_cartilage", 3: "tibia", 4: "tibial_cartilage",
     }).items()}
@@ -1625,13 +1729,28 @@ def main(cfg_path: str):
 
         # Resolutions the two branches are actually supervised at: STD goes
         # through logit1 (full patch), EXP through logit2 (one decoder level up).
+        #
+        # The two branches must be probed at DIFFERENT input shapes. EXP is always
+        # resampled to patch_size, so patch_size is right for it. STD is a raw crop,
+        # and _compute_patch_bounds clips any axis shorter than patch_size to the
+        # volume's full extent -- OAI DESS is (384,384,160), so a [200,200,200]
+        # request yields a (200,200,160) STD patch. Probing STD at patch_size would
+        # make the bank measure its targets on a label nearest-UPSAMPLED 160->200,
+        # i.e. with ~40 duplicated slices, against predictions the model never makes
+        # at that shape. Take the STD shape from a real sample instead of the config.
         raw_model_for_shape = model.module if use_ddp else model
+        std_in = tuple(int(v) for v in train_loader.dataset[0]["std_img"].shape[-3:])
+        exp_in = tuple(int(v) for v in cfg["patch_size"])
         with torch.no_grad():
-            probe = torch.zeros(1, int(cfg["in_channels"]), *cfg["patch_size"], device=device)
-            o = raw_model_for_shape(probe, expanded=False)
-            std_shape = tuple(int(v) for v in o["logit1"].shape[-3:])
-            exp_shape = tuple(int(v) for v in o["logit2"].shape[-3:])
-            del probe, o
+            probe = torch.zeros(1, int(cfg["in_channels"]), *std_in, device=device)
+            std_shape = tuple(int(v) for v in raw_model_for_shape(probe, expanded=False)["logit1"].shape[-3:])
+            del probe
+            probe = torch.zeros(1, int(cfg["in_channels"]), *exp_in, device=device)
+            exp_shape = tuple(int(v) for v in raw_model_for_shape(probe, expanded=True)["logit2"].shape[-3:])
+            del probe
+        if is_main and std_in != exp_in:
+            print(f"[bank] STD patch is {std_in}, not patch_size {exp_in} "
+                  f"(volume shorter than patch_size on some axis)")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         shapes = {"std": std_shape, "exp": exp_shape}
@@ -1714,12 +1833,20 @@ def main(cfg_path: str):
         loss_sum_dist = 0.0
         grad_norm_sum = 0.0
         grad_clipped = 0.0
-        sat_ok = {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
-                  for g in DESC_SLICES}
-        sat_tot = {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
-                   for g in DESC_SLICES}
-        err_sum_vol = {int(c): 0.0 for c in volume_classes}
-        err_sum_cent = {int(c): 0.0 for c in centroid_classes}
+        sat_ok = {p: {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
+                      for g in DESC_SLICES} for p in PATCH_KEYS}
+        sat_tot = {p: {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
+                       for g in DESC_SLICES} for p in PATCH_KEYS}
+        err_sum_vol = {p: {int(c): 0.0 for c in volume_classes} for p in PATCH_KEYS}
+        err_sum_cent = {p: {int(c): 0.0 for c in centroid_classes} for p in PATCH_KEYS}
+        err_sum_axis = {p: [0.0, 0.0, 0.0] for p in PATCH_KEYS}
+        # [soft_frac, hard_frac, mean_p_in_gt, gt_frac] per class, per branch
+        soft_sum = {p: torch.zeros(len(bank_classes), 4, dtype=torch.float64, device=device)
+                    for p in PATCH_KEYS}
+        soft_n = {p: 0 for p in PATCH_KEYS}
+        # steps on which each branch actually applied the shape loss -- the right
+        # denominator for that branch's achieved error
+        n_it_patch = {p: 0 for p in PATCH_KEYS}
         n_dist = 0
         dist_last = {}
         loss_sum_seg_logged = 0.0
@@ -1833,8 +1960,13 @@ def main(cfg_path: str):
                                     _p, _g, _pr,
                                     [vol_tol_by_class.get(int(_c), float('inf')) for _c in bank_classes],
                                     centroid_tolerance, avgdist_axis_tolerance).items():
-                                sat_ok[_grp] += _ok.double()
-                                sat_tot[_grp] += _tt.double()
+                                sat_ok[patch_key][_grp] += _ok.double()
+                                sat_tot[patch_key][_grp] += _tt.double()
+
+                if sat_every_n_steps > 0 and (i % sat_every_n_steps == 0) and desc_logits.shape[0] > 0:
+                    soft_sum[patch_key] += softness_summary(
+                        desc_logits, desc_lbl, bank_classes, cfg["n_classes"])
+                    soft_n[patch_key] += 1
 
                 vol_loss = logits.new_tensor(0.0)
                 cent_loss = logits.new_tensor(0.0)
@@ -2083,10 +2215,18 @@ def main(cfg_path: str):
             seg_loss_bw_v = float(seg_loss_bw.detach())
             vol_loss_v = float(vol_loss.detach())
             cent_loss_v = float(cent_loss.detach())
-            for _j, _c in enumerate(volume_classes):
-                err_sum_vol[int(_c)] += float(vol_errs[_j].detach())
-            for _c in centroid_classes:
-                err_sum_cent[int(_c)] += float(cent_errs_per_class[int(_c)].detach())
+            # Only steps that actually applied the shape loss contribute. On a step
+            # where apply_shape is False these *_errs are still zero tensors, and
+            # averaging those in would silently halve every reported error whenever
+            # shape_on is "std" or "exp" rather than "both".
+            if apply_shape:
+                n_it_patch[patch_key] += 1
+                for _j, _c in enumerate(volume_classes):
+                    err_sum_vol[patch_key][int(_c)] += float(vol_errs[_j].detach())
+                for _c in centroid_classes:
+                    err_sum_cent[patch_key][int(_c)] += float(cent_errs_per_class[int(_c)].detach())
+                for _j in range(3):
+                    err_sum_axis[patch_key][_j] += float(avgdist_axis_stats[_j].detach())
             dist_loss_v = float(dist_loss.detach())
             if dist_stats is not None:
                 loss_sum_dist += dist_loss_v
@@ -2214,6 +2354,40 @@ def main(cfg_path: str):
             for idx, c in enumerate(moment_inv_classes):
                 loss_sum_moment_inv_err_per_class[c] = vals[20 + n_m2c + n_m3c + idx]
 
+            # Per-branch achieved-error sums and their step counts. These were
+            # previously not reduced at all while being divided by the globally
+            # reduced n_it, so under DDP every achieved error was reported a factor
+            # of world_size too small.
+            _pt = torch.tensor(
+                [float(n_it_patch[p]) for p in PATCH_KEYS]
+                + [err_sum_vol[p][int(c)] for p in PATCH_KEYS for c in volume_classes]
+                + [err_sum_cent[p][int(c)] for p in PATCH_KEYS for c in centroid_classes]
+                + [err_sum_axis[p][j] for p in PATCH_KEYS for j in range(3)],
+                device=device, dtype=torch.float64,
+            )
+            dist.all_reduce(_pt, op=dist.ReduceOp.SUM)
+            _pv = _pt.cpu().tolist()
+            _o = 0
+            for p in PATCH_KEYS:
+                n_it_patch[p] = int(_pv[_o]); _o += 1
+            for p in PATCH_KEYS:
+                for c in volume_classes:
+                    err_sum_vol[p][int(c)] = _pv[_o]; _o += 1
+            for p in PATCH_KEYS:
+                for c in centroid_classes:
+                    err_sum_cent[p][int(c)] = _pv[_o]; _o += 1
+            for p in PATCH_KEYS:
+                for j in range(3):
+                    err_sum_axis[p][j] = _pv[_o]; _o += 1
+
+            for p in PATCH_KEYS:
+                dist.all_reduce(soft_sum[p], op=dist.ReduceOp.SUM)
+            _sn = torch.tensor([float(soft_n[p]) for p in PATCH_KEYS],
+                               device=device, dtype=torch.float64)
+            dist.all_reduce(_sn, op=dist.ReduceOp.SUM)
+            for _i, p in enumerate(PATCH_KEYS):
+                soft_n[p] = int(_sn[_i])
+
         # epoch averages
         loss_tr_total = loss_sum_total / max(1, n_it)
         loss_tr_seg_logged = loss_sum_seg_logged / max(1, n_it)
@@ -2234,8 +2408,21 @@ def main(cfg_path: str):
         loss_tr_moment_inv_J1_err = loss_sum_moment_inv_J1_err / max(1, n_it)
         loss_tr_moment_inv_J2_err = loss_sum_moment_inv_J2_err / max(1, n_it)
         loss_tr_moment_inv_J3_err = loss_sum_moment_inv_J3_err / max(1, n_it)
-        err_tr_vol  = {c: err_sum_vol[c]  / max(1, n_it) for c in err_sum_vol}
-        err_tr_cent = {c: err_sum_cent[c] / max(1, n_it) for c in err_sum_cent}
+        # Per branch, each divided by the steps that branch actually ran.
+        err_tr_vol_p  = {p: {c: err_sum_vol[p][c]  / max(1, n_it_patch[p])
+                             for c in err_sum_vol[p]} for p in PATCH_KEYS}
+        err_tr_cent_p = {p: {c: err_sum_cent[p][c] / max(1, n_it_patch[p])
+                             for c in err_sum_cent[p]} for p in PATCH_KEYS}
+        err_tr_axis_p = {p: [err_sum_axis[p][j] / max(1, n_it_patch[p]) for j in range(3)]
+                         for p in PATCH_KEYS}
+        # Blended over branches, keeping the original desc/* keys meaningful. The
+        # denominator is the number of shape steps, not n_it, so the value no longer
+        # drifts with shape_on.
+        _n_shape = sum(n_it_patch.values())
+        err_tr_vol  = {c: sum(err_sum_vol[p][c]  for p in PATCH_KEYS) / max(1, _n_shape)
+                       for c in err_sum_vol[PATCH_KEYS[0]]}
+        err_tr_cent = {c: sum(err_sum_cent[p][c] for p in PATCH_KEYS) / max(1, _n_shape)
+                       for c in err_sum_cent[PATCH_KEYS[0]]}
         loss_tr_moment2_err_per_class   = {c: loss_sum_moment2_err_per_class[c]   / max(1, n_it) for c in moment2_classes}
         loss_tr_moment3_err_per_class   = {c: loss_sum_moment3_err_per_class[c]   / max(1, n_it) for c in moment3_classes}
         loss_tr_moment_inv_err_per_class = {c: loss_sum_moment_inv_err_per_class[c] / max(1, n_it) for c in moment_inv_classes}
@@ -2301,12 +2488,23 @@ def main(cfg_path: str):
         sat_log = {}
         if sat_every_n_steps > 0:
             if use_ddp:
-                for _g in DESC_SLICES:
-                    dist.all_reduce(sat_ok[_g], op=dist.ReduceOp.SUM)
-                    dist.all_reduce(sat_tot[_g], op=dist.ReduceOp.SUM)
+                for _p in PATCH_KEYS:
+                    for _g in DESC_SLICES:
+                        dist.all_reduce(sat_ok[_p][_g], op=dist.ReduceOp.SUM)
+                        dist.all_reduce(sat_tot[_p][_g], op=dist.ReduceOp.SUM)
             _all_ok = _all_tot = 0.0
             for _g in DESC_SLICES:
-                ok, tot = sat_ok[_g], sat_tot[_g]
+                # per branch -- sat/std_volume_c4, sat/exp_centroid_c2, ...
+                for _p in PATCH_KEYS:
+                    ok, tot = sat_ok[_p][_g], sat_tot[_p][_g]
+                    for _i, _c in enumerate(bank_classes):
+                        if float(tot[_i]) > 0:
+                            sat_log[f"sat/{_p}_{_g}_c{_c}"] = float(ok[_i] / tot[_i])
+                    if float(tot.sum()) > 0:
+                        sat_log[f"sat/{_p}_{_g}"] = float(ok.sum() / tot.sum())
+                # blended across branches, under the original key names
+                ok = sum(sat_ok[_p][_g] for _p in PATCH_KEYS)
+                tot = sum(sat_tot[_p][_g] for _p in PATCH_KEYS)
                 for _i, _c in enumerate(bank_classes):
                     if float(tot[_i]) > 0:
                         sat_log[f"sat/{_g}_c{_c}"] = float(ok[_i] / tot[_i])
@@ -2317,13 +2515,47 @@ def main(cfg_path: str):
                 sat_log["sat/overall"] = _all_ok / _all_tot
 
             if is_main and constraint_report_every > 0 and (epoch == 1 or epoch % constraint_report_every == 0):
-                parts = []
-                for _g in DESC_SLICES:
-                    per_c = "/".join(
-                        f"{sat_log.get(f'sat/{_g}_c{_c}', float('nan')):.2f}" for _c in bank_classes)
-                    parts.append(f"{_g}={sat_log.get(f'sat/{_g}', float('nan')):.2f} [{per_c}]")
-                print(f"    [satisfied] ep{epoch} overall={sat_log.get('sat/overall', float('nan')):.2f}  "
-                      + "  ".join(parts))
+                print(f"    [satisfied] ep{epoch} overall={sat_log.get('sat/overall', float('nan')):.2f}")
+                for _p in PATCH_KEYS:
+                    if float(sum(float(sat_tot[_p][_g].sum()) for _g in DESC_SLICES)) <= 0:
+                        continue   # branch never ran (shape_on restricts to the other)
+                    parts = []
+                    for _g in DESC_SLICES:
+                        per_c = "/".join(
+                            f"{sat_log.get(f'sat/{_p}_{_g}_c{_c}', float('nan')):.2f}"
+                            for _c in bank_classes)
+                        parts.append(f"{_g}={sat_log.get(f'sat/{_p}_{_g}', float('nan')):.2f} [{per_c}]")
+                    print(f"      {_p} (n={n_it_patch[_p]}): " + "  ".join(parts))
+
+        # --- softness: do the soft descriptors mean what argmax measures? ----
+        # hard_over_soft -> 1 means sum(p_c) is behaving like a voxel count, so the
+        # volume barrier constrains what evaluation measures. Near 0 means the class
+        # is a fog: the barrier can be perfectly satisfied while the class wins
+        # argmax nowhere and Dice stays 0.
+        soft_log = {}
+        for _p in PATCH_KEYS:
+            if soft_n[_p] <= 0:
+                continue
+            _m = (soft_sum[_p] / soft_n[_p]).cpu()
+            for _i, _c in enumerate(bank_classes):
+                _sf, _hf, _mp, _gf = (float(v) for v in _m[_i])
+                soft_log[f"soft/{_p}_soft_frac_c{_c}"]     = _sf
+                soft_log[f"soft/{_p}_hard_frac_c{_c}"]     = _hf
+                soft_log[f"soft/{_p}_hard_over_soft_c{_c}"] = _hf / max(_sf, 1e-12)
+                soft_log[f"soft/{_p}_mean_p_in_gt_c{_c}"]  = _mp
+                # >1 overshoot (the class is eating its neighbours), <1 undershoot
+                soft_log[f"soft/{_p}_hard_over_gt_c{_c}"]  = _hf / max(_gf, 1e-12)
+
+        if (is_main and soft_log and constraint_report_every > 0
+                and (epoch == 1 or epoch % constraint_report_every == 0)):
+            for _p in PATCH_KEYS:
+                if soft_n[_p] <= 0:
+                    continue
+                print(f"    [softness] ep{epoch} {_p}: " + "  ".join(
+                    f"c{_c} h/s={soft_log[f'soft/{_p}_hard_over_soft_c{_c}']:.2f}"
+                    f" p_in_gt={soft_log[f'soft/{_p}_mean_p_in_gt_c{_c}']:.2f}"
+                    f" h/gt={soft_log[f'soft/{_p}_hard_over_gt_c{_c}']:.2f}"
+                    for _c in bank_classes))
 
         # --- distribution-constraint status ---------------------------------
         # Logged as signed slack z: z <= 0 satisfied (magnitude = headroom),
@@ -2485,12 +2717,34 @@ def main(cfg_path: str):
                     size=viz_sample["std_img"].shape[-3:],
                     mode="nearest",
                 )[0, 0].long().cpu().numpy()
+                prob_full = None
+                if viz_prob_classes:
+                    # NEAREST on purpose: trilinear would blend neighbouring voxels
+                    # and smooth a speckled fog into something that looks like a
+                    # coherent structure. The panel must show the model's actual
+                    # probabilities, not an interpolation of them.
+                    _pr = F.softmax(out["logit1"].float(), dim=1)
+                    if tuple(_pr.shape[-3:]) != tuple(viz_sample["std_img"].shape[-3:]):
+                        _pr = F.interpolate(_pr, size=viz_sample["std_img"].shape[-3:],
+                                            mode="nearest")
+                    prob_full = _pr[0].cpu().numpy()
             img_slice = np.take(viz_sample["std_img"][0].numpy(), viz_slice_idx, axis=viz_slice_axis)
             gt_slice = np.take(viz_sample["std_lbl"].numpy(), viz_slice_idx, axis=viz_slice_axis)
             pred_slice = np.take(pred_full, viz_slice_idx, axis=viz_slice_axis)
             viz_log = {
                 "viz/segmentation": build_viz_wandb_image(img_slice, gt_slice, pred_slice, viz_class_names)
             }
+            if prob_full is not None:
+                prob_slices, prob_stats = {}, {}
+                for _c in viz_prob_classes:
+                    _ps = np.take(prob_full[int(_c)], viz_slice_idx, axis=viz_slice_axis)
+                    prob_slices[int(_c)] = _ps
+                    _gm = (gt_slice == int(_c))
+                    prob_stats[int(_c)] = (
+                        f"max={_ps.max():.2f}  mean in GT={_ps[_gm].mean():.2f}"
+                        if _gm.any() else f"max={_ps.max():.2f}  (no GT on slice)")
+                viz_log["viz/prob_maps"] = build_prob_wandb_image(
+                    img_slice, gt_slice, prob_slices, viz_class_names, prob_stats)
 
         if use_wandb and is_main:
             wandb.log({
@@ -2523,6 +2777,26 @@ def main(cfg_path: str):
                 **{f"desc/vol_err_over_tol_c{c}": err_tr_vol[c] / max(vol_tol_by_class[c], 1e-12) for c in err_tr_vol},
                 **{f"desc/cent_err_c{c}": err_tr_cent[c] for c in err_tr_cent},
                 **{f"desc/cent_err_over_tol_c{c}": err_tr_cent[c] / max(centroid_tolerance, 1e-12) for c in err_tr_cent},
+                # --- the same achieved errors, split by patch branch -----------
+                # err/tol is the direct read on how permissive the band is for that
+                # branch: <<1 means the tolerance constrains nothing, >1 means it is
+                # still binding. Only emitted for branches that actually ran.
+                **{f"desc/{p}_n_steps": float(n_it_patch[p]) for p in PATCH_KEYS},
+                **{f"desc/{p}_vol_err_rel_c{c}": err_tr_vol_p[p][c]
+                   for p in PATCH_KEYS if n_it_patch[p] > 0 for c in err_tr_vol_p[p]},
+                **{f"desc/{p}_vol_err_over_tol_c{c}":
+                   err_tr_vol_p[p][c] / max(vol_tol_by_class[c], 1e-12)
+                   for p in PATCH_KEYS if n_it_patch[p] > 0 for c in err_tr_vol_p[p]},
+                **{f"desc/{p}_cent_err_c{c}": err_tr_cent_p[p][c]
+                   for p in PATCH_KEYS if n_it_patch[p] > 0 for c in err_tr_cent_p[p]},
+                **{f"desc/{p}_cent_err_over_tol_c{c}":
+                   err_tr_cent_p[p][c] / max(centroid_tolerance, 1e-12)
+                   for p in PATCH_KEYS if n_it_patch[p] > 0 for c in err_tr_cent_p[p]},
+                **{f"desc/{p}_axis_err_{ax}": err_tr_axis_p[p][j]
+                   for p in PATCH_KEYS if n_it_patch[p] > 0 for j, ax in enumerate("zyx")},
+                **{f"desc/{p}_axis_err_over_tol_{ax}":
+                   err_tr_axis_p[p][j] / max(avgdist_axis_tolerance, 1e-12)
+                   for p in PATCH_KEYS if n_it_patch[p] > 0 for j, ax in enumerate("zyx")},
                 # The barrier itself, as flat series, so wandb can overlay them on
                 # the error panels: a descriptor is inside its constraint while its
                 # curve sits below the matching tolerance line, and err_over_tol
@@ -2559,6 +2833,7 @@ def main(cfg_path: str):
                 **{f"schedule/barrier_t_{_n}": _t for _n, _t in _moment_barrier_ts.items()},
                 "schedule/barrier_t_shape": barrier_shape.t,
                 "schedule/barrier_t_moment": barrier.t,
+                **soft_log,
                 **viz_log,
                 **collapse_log,
                 **dist_log,
@@ -2633,6 +2908,23 @@ def main(cfg_path: str):
                 f"best={best_metric:.4f} "
                 f"pat={patience}/{early_pat}"
             )
+            # Per-branch err/tol, printed only when both branches actually ran --
+            # the blended line above cannot show that a band is permissive on one
+            # branch and binding on the other.
+            if sum(1 for _p in PATCH_KEYS if n_it_patch[_p] > 0) > 1:
+                for _p in PATCH_KEYS:
+                    print(
+                        f"      [{_p}] n={n_it_patch[_p]} err/tol "
+                        f"vol=" + "/".join(
+                            f"{err_tr_vol_p[_p][c] / max(vol_tol_by_class[c], 1e-12):.2f}"
+                            for c in sorted(err_tr_vol_p[_p])) + " "
+                        f"cent=" + "/".join(
+                            f"{err_tr_cent_p[_p][c] / max(centroid_tolerance, 1e-12):.2f}"
+                            for c in sorted(err_tr_cent_p[_p])) + " "
+                        f"axis=" + "/".join(
+                            f"{v / max(avgdist_axis_tolerance, 1e-12):.2f}"
+                            for v in err_tr_axis_p[_p])
+                    )
 
         if patience >= early_pat:
             if is_main:
