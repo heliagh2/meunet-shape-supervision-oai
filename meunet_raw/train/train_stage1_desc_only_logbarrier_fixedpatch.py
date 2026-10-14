@@ -382,7 +382,14 @@ def softness_summary(logits, target, classes, n_classes, ignore_index=-1, eps=1e
     argmax nowhere -- soft_frac on target, hard_frac ~ 0 -- and no barrier on
     sum(p_c) can tell the difference. Logging both makes it directly visible.
 
-    Returns (len(classes), 4): [soft_frac, hard_frac, mean_p_inside_gt, gt_frac],
+    Also returns the concentration ratio h = sum(p^2)/sum(p), which is 1 for a binary
+    map and ~mean(p) for a diffuse one. This is the quantity the descriptor set is
+    blind to: a sheet thickened perpendicular to itself at low p keeps sum(p), keeps
+    its centroid, and moves only the one axis spread that is thickness-dominated --
+    the other two are set by in-plane extent and do not move at all. So every barrier
+    can read as satisfied while h sits at 0.2 and the class wins argmax nowhere.
+
+    Returns (len(classes), 5): [soft_frac, hard_frac, mean_p_inside_gt, gt_frac, h],
     averaged over the batch. The fracs are over VALID voxels, so soft_frac and
     gt_frac are on the same footing as the volume descriptor itself.
     """
@@ -407,7 +414,9 @@ def softness_summary(logits, target, classes, n_classes, ignore_index=-1, eps=1e
             mean_in = ((pc * gc).sum(dim=(1, 2, 3)) / gm.clamp(min=eps))[present].mean()
         else:
             mean_in = logits.new_tensor(0.0)
-        rows.append(torch.stack([soft_frac, hard_frac, mean_in, (gm / tot).mean()]))
+        psum = pc.sum(dim=(1, 2, 3))
+        hard_ratio = ((pc ** 2).sum(dim=(1, 2, 3)) / psum.clamp(min=eps)).mean()
+        rows.append(torch.stack([soft_frac, hard_frac, mean_in, (gm / tot).mean(), hard_ratio]))
     return torch.stack(rows, 0).double()
 
 
@@ -902,6 +911,61 @@ def compute_volume_barrier(
             (rel * present).sum(dim=0) / present.sum(dim=0).clamp(min=1),
             torch.zeros_like(rel[0]),
         )
+    return loss, per_class
+
+
+def compute_concentration_barrier(
+    logits,
+    target,
+    n_classes,
+    concentration_classes,
+    barrier: LogBarrierLoss,
+    concentration_tolerance=0.25,
+    ignore_index=-1,
+    eps=1e-6,
+    return_stats=False,
+):
+    """
+    One-sided constraint making the SMEARED solution infeasible.
+
+        concentration = sum(p^2) / sum(p)        in [0,1]
+
+    This is the differentiable stand-in for the hard/soft ratio you log. It
+    equals the typical probability value where the mass sits: 1.0 for a binary
+    mask, 0.26 for a cloud at p=0.26. Crucially it is NOT a function of total
+    mass -- 50 voxels at p=1.0 and 500 at p=0.1 carry the same soft mass and the
+    volume constraint cannot distinguish them, while this reads 1.00 vs 0.10.
+
+    Enforce:   concentration >= 1 - tol     i.e.   z = (1 - tol) - conc <= 0
+
+    One-sided on purpose: conc = 1 is unreachable under a 5-way softmax, and a
+    two-sided band would just saturate logits. We want "committed enough", not
+    "binary". With volume fixing sum(p) = M and this fixing the mass to be
+    concentrated, the model has to commit ~M voxels rather than spread M across
+    5M voxels at p=0.2 -- which is what produced hard/soft = 0.00 on both
+    cartilage classes while every moment constraint read satisfied.
+
+    The argmax-based h you log has zero gradient, which is why it cannot be used
+    as the loss directly.
+    """
+    device = logits.device
+    probs = F.softmax(logits.float(), dim=1)
+    valid = (target != ignore_index).float().unsqueeze(1)
+    probs = probs * valid
+
+    dims = (2, 3, 4)
+    cls_idx = torch.as_tensor(concentration_classes, device=device, dtype=torch.long)
+    p_sel = probs[:, cls_idx]                                    # (B,C,D,H,W)
+    mass = p_sel.sum(dim=dims)                                   # (B,C)
+    conc = (p_sel ** 2).sum(dim=dims) / mass.clamp(min=eps)      # (B,C)
+
+    ctol = _sample_tol(concentration_tolerance, conc.shape[0], device)
+    z = (1.0 - ctol) - conc                                      # <= 0 wanted
+    loss = barrier(z.reshape(-1))
+    if not return_stats:
+        return loss
+    with torch.no_grad():
+        per_class = conc.mean(dim=0)
     return loss, per_class
 
 
@@ -1681,6 +1745,21 @@ def main(cfg_path: str):
     sat_every_n_steps = int(cfg.get("constraint_sat_every_n_steps", 10))
     # Express every constraint violation in units of its own tolerance. Removes
     # the dead zone structurally and makes a satisfied term contribute exactly 0.
+    # Concentration ("don't smear") constraint. Off by default.
+    lambda_concentration = float(cfg.get("lambda_concentration", 0.0))
+    concentration_classes = as_int_list(cfg.get("concentration_classes", []), default=[])
+    _ct = cfg.get("concentration_tolerance", 0.25)
+    concentration_tolerance = ([float(v) for v in _ct] if isinstance(_ct, (list, tuple))
+                               else float(_ct))
+    # Ramp it in: at epoch 1 the prediction is near-uniform and the mass is in the
+    # wrong place, so demanding concentration immediately would make the model
+    # confidently wrong. Let volume/centroid/spread place the mass first, then
+    # sharpen. Same shape as the existing moment3 warmup.
+    conc_warmup_start = int(cfg.get("concentration_warmup_start", 0))
+    conc_warmup_end = int(cfg.get("concentration_warmup_end", 0))
+    if is_main and lambda_concentration > 0.0:
+        print(f"[concentration] lambda={lambda_concentration} classes={concentration_classes} "
+              f"tol={concentration_tolerance} warmup={conc_warmup_start}->{conc_warmup_end}")
     constraint_normalize = bool(cfg.get("constraint_normalize", False))
     volume_log_space = bool(cfg.get("volume_log_space", False))
     if is_main and volume_log_space:
@@ -1821,6 +1900,13 @@ def main(cfg_path: str):
             lambda_moment3_eff = lambda_moment3
             lambda_moment3_offdiag_eff = lambda_moment3_offdiag
 
+        if conc_warmup_end > conc_warmup_start and epoch <= conc_warmup_end:
+            lambda_conc_eff = (0.0 if epoch <= conc_warmup_start else
+                               lambda_concentration * (epoch - conc_warmup_start)
+                               / (conc_warmup_end - conc_warmup_start))
+        else:
+            lambda_conc_eff = lambda_concentration
+
         # tighten the shape barrier (volume/centroid/avgdist/avgdist_axis) each epoch;
         # moment2/moment3/moment_inv keep using the static `barrier` at fixed barrier_t
         barrier_shape.t = min(barrier_t * (barrier_t_mu ** (epoch - 1)), barrier_t_max)
@@ -1831,6 +1917,8 @@ def main(cfg_path: str):
         model.train()
         loss_sum_total = 0.0
         loss_sum_dist = 0.0
+        conc_sum = 0.0
+        conc_val_sum = {int(c): 0.0 for c in concentration_classes}
         grad_norm_sum = 0.0
         grad_clipped = 0.0
         sat_ok = {p: {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
@@ -1841,7 +1929,7 @@ def main(cfg_path: str):
         err_sum_cent = {p: {int(c): 0.0 for c in centroid_classes} for p in PATCH_KEYS}
         err_sum_axis = {p: [0.0, 0.0, 0.0] for p in PATCH_KEYS}
         # [soft_frac, hard_frac, mean_p_in_gt, gt_frac] per class, per branch
-        soft_sum = {p: torch.zeros(len(bank_classes), 4, dtype=torch.float64, device=device)
+        soft_sum = {p: torch.zeros(len(bank_classes), 5, dtype=torch.float64, device=device)
                     for p in PATCH_KEYS}
         soft_n = {p: 0 for p in PATCH_KEYS}
         # steps on which each branch actually applied the shape loss -- the right
@@ -1981,6 +2069,8 @@ def main(cfg_path: str):
                 moment2_err = logits.new_tensor(0.0)
                 moment3_err = logits.new_tensor(0.0)
                 moment_inv_stats = logits.new_zeros(3)  # [err_J1, err_J2, err_J3]
+                conc_loss = logits.new_tensor(0.0)
+                conc_vals = logits.new_zeros(len(concentration_classes)) if concentration_classes else logits.new_zeros(1)
                 vol_errs = logits.new_zeros(len(volume_classes)) if volume_classes else logits.new_zeros(1)
                 cent_errs_per_class = {int(c): logits.new_tensor(0.0) for c in centroid_classes}
                 m2_errs_per_class = {c: logits.new_tensor(0.0) for c in moment2_classes}
@@ -2017,6 +2107,17 @@ def main(cfg_path: str):
                                         if use_bank is not None else None),
                             log_space=volume_log_space,
                             normalize=constraint_normalize,
+                        )
+
+                    if lambda_conc_eff > 0.0 and len(concentration_classes) > 0:
+                        conc_loss, conc_vals = compute_concentration_barrier(
+                            logits=desc_logits,
+                            target=desc_lbl,
+                            n_classes=cfg["n_classes"],
+                            concentration_classes=concentration_classes,
+                            barrier=barrier_shape,
+                            concentration_tolerance=concentration_tolerance,
+                            return_stats=True,
                         )
 
                     if lambda_centroid > 0.0 and len(centroid_classes) > 0:
@@ -2192,6 +2293,7 @@ def main(cfg_path: str):
                     + lambda_moment3_offdiag_eff * moment3_offdiag_loss
                     + moment_inv_loss
                     + lambda_dist * dist_loss
+                    + lambda_conc_eff * conc_loss
                 )
 
                 if not total_loss.requires_grad:
@@ -2227,6 +2329,9 @@ def main(cfg_path: str):
                     err_sum_cent[patch_key][int(_c)] += float(cent_errs_per_class[int(_c)].detach())
                 for _j in range(3):
                     err_sum_axis[patch_key][_j] += float(avgdist_axis_stats[_j].detach())
+            conc_sum += float(conc_loss.detach())
+            for _j, _c in enumerate(concentration_classes):
+                conc_val_sum[int(_c)] += float(conc_vals[_j].detach())
             dist_loss_v = float(dist_loss.detach())
             if dist_stats is not None:
                 loss_sum_dist += dist_loss_v
@@ -2538,13 +2643,15 @@ def main(cfg_path: str):
                 continue
             _m = (soft_sum[_p] / soft_n[_p]).cpu()
             for _i, _c in enumerate(bank_classes):
-                _sf, _hf, _mp, _gf = (float(v) for v in _m[_i])
+                _sf, _hf, _mp, _gf, _hr = (float(v) for v in _m[_i])
                 soft_log[f"soft/{_p}_soft_frac_c{_c}"]     = _sf
                 soft_log[f"soft/{_p}_hard_frac_c{_c}"]     = _hf
                 soft_log[f"soft/{_p}_hard_over_soft_c{_c}"] = _hf / max(_sf, 1e-12)
                 soft_log[f"soft/{_p}_mean_p_in_gt_c{_c}"]  = _mp
                 # >1 overshoot (the class is eating its neighbours), <1 undershoot
                 soft_log[f"soft/{_p}_hard_over_gt_c{_c}"]  = _hf / max(_gf, 1e-12)
+                # 1.0 = binary, ~mean(p) = fog. The barriers cannot see this.
+                soft_log[f"soft/{_p}_conc_ratio_c{_c}"]    = _hr
 
         if (is_main and soft_log and constraint_report_every > 0
                 and (epoch == 1 or epoch % constraint_report_every == 0)):
@@ -2555,6 +2662,7 @@ def main(cfg_path: str):
                     f"c{_c} h/s={soft_log[f'soft/{_p}_hard_over_soft_c{_c}']:.2f}"
                     f" p_in_gt={soft_log[f'soft/{_p}_mean_p_in_gt_c{_c}']:.2f}"
                     f" h/gt={soft_log[f'soft/{_p}_hard_over_gt_c{_c}']:.2f}"
+                    f" conc={soft_log[f'soft/{_p}_conc_ratio_c{_c}']:.2f}"
                     for _c in bank_classes))
 
         # --- distribution-constraint status ---------------------------------
@@ -2683,7 +2791,10 @@ def main(cfg_path: str):
         # Weighted share each descriptor takes of the total. Normalisation changed
         # every term's scale, so the lambda balance that was tuned against the old
         # scales no longer necessarily holds -- this is the direct read on it.
+        conc_tr = conc_sum / max(1, n_it)
+        conc_val_tr = {c: conc_val_sum[c] / max(1, n_it) for c in conc_val_sum}
         _contribs = {
+            "conc": lambda_conc_eff * conc_tr,
             "vol": lambda_volume * loss_tr_vol,
             "cent": lambda_centroid * loss_tr_cent,
             "avgdist": lambda_avgdist * loss_tr_avgdist,
@@ -2815,6 +2926,14 @@ def main(cfg_path: str):
                 # weighted contributions (lambda × barrier) — what drives the gradient
                 **_share,
                 **_gstats,
+                # concentration = sum(p^2)/sum(p): 1.0 = binary, 0.26 = the
+                # diffuse cloud A1.10 settled on. Target is 1 - tol.
+                "desc/conc_barrier": conc_tr,
+                "schedule/lambda_conc_eff": lambda_conc_eff,
+                **{f"desc/conc_c{c}": v for c, v in conc_val_tr.items()},
+                **{f"desc/conc_target": (1.0 - (concentration_tolerance
+                                                if not isinstance(concentration_tolerance, list)
+                                                else float(np.mean(concentration_tolerance))))},
                 "contrib/vol":          lambda_volume    * loss_tr_vol,
                 "contrib/cent":         lambda_centroid  * loss_tr_cent,
                 "contrib/avgdist":      lambda_avgdist   * loss_tr_avgdist,
@@ -2893,7 +3012,9 @@ def main(cfg_path: str):
                 f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
                 # achieved error as a multiple of the tolerance being asked for:
                 # <1 satisfied (and <<1 means the tolerance constrains nothing)
-                f"share vol={_contribs['vol'] / max(_contrib_tot, 1e-12):.2f} "
+                + (f"conc=" + "/".join(f"{conc_val_tr[c]:.2f}" for c in sorted(conc_val_tr)) + " | "
+                   if conc_val_tr else "")
+                + f"share vol={_contribs['vol'] / max(_contrib_tot, 1e-12):.2f} "
                 f"cent={_contribs['cent'] / max(_contrib_tot, 1e-12):.2f} "
                 f"axis={_contribs['avgdist_axis'] / max(_contrib_tot, 1e-12):.2f} | "
                 f"gnorm={grad_norm_sum / max(1, n_it):.2f} clip={grad_clipped / max(1, n_it):.0%} | "
