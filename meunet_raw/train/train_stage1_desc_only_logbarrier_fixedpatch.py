@@ -924,6 +924,7 @@ def compute_concentration_barrier(
     ignore_index=-1,
     eps=1e-6,
     return_stats=False,
+    use_all=None,
 ):
     """
     One-sided constraint making the SMEARED solution infeasible.
@@ -950,7 +951,11 @@ def compute_concentration_barrier(
     """
     device = logits.device
     probs = F.softmax(logits.float(), dim=1)
+    # This constraint reads only the prediction -- no label anywhere -- so it
+    # applies to label-withheld cases too. `use_all` marks those: their target is
+    # pure ignore, which would otherwise zero the mask and the gradient with it.
     valid = (target != ignore_index).float().unsqueeze(1)
+    valid = _bank_valid(valid, use_all)
     probs = probs * valid
 
     dims = (2, 3, 4)
@@ -2110,9 +2115,11 @@ def main(cfg_path: str):
                         )
 
                     if lambda_conc_eff > 0.0 and len(concentration_classes) > 0:
+                        # full batch: label-free, so withheld cases are included
                         conc_loss, conc_vals = compute_concentration_barrier(
-                            logits=desc_logits,
-                            target=desc_lbl,
+                            logits=logits,
+                            target=lbl_rs,
+                            use_all=(~has_gt) if not bool(has_gt.all()) else None,
                             n_classes=cfg["n_classes"],
                             concentration_classes=concentration_classes,
                             barrier=barrier_shape,

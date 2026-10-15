@@ -1,13 +1,16 @@
-# === A1.4: distribution matching on the unannotated pool ===
-# All 356 train cases. The 107 annotated keep their own GT targets at the
-# ORIGINAL tight tolerances (0.10 / 0.05) -- no widening is needed anywhere here.
-# The 249 withheld cases are loaded with their labels replaced by ignore, and are
-# constrained only in AGGREGATE:
-#     |mean_pool(d) - bank_mean| <= k*sigma/sqrt(n_eff)
-#     |std_pool(d)  - bank_std | <= 0.25*bank_std
-# The std constraint is the point: collapsing every prediction onto the mean now
-# VIOLATES a constraint rather than satisfying all of them, which is the failure
-# mode a per-sample population target (A2) cannot avoid.
+# === A2.2: the naive contrast -- per-sample population targets ===
+# (was A2_bank_unannotated.)
+#
+# Same 356 cases and the same split as A2.1. The ONLY difference is how the 249
+# withheld cases are supervised: each is handed the population MEAN as its own
+# per-sample target, with the wide tolerances that requires (a +-10% band around
+# the mean is infeasible for ~70% of cases).
+#
+# Expected to underperform A2.1. An identical target for every scan carries no
+# per-case information and its barrier is minimised by predicting mean anatomy
+# for everyone -- it destroys the population variance that A2.1's std constraint
+# explicitly preserves. It is here as the contrast that justifies the extra
+# machinery, not as a candidate method.
 
 # dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
 
@@ -17,19 +20,30 @@ labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentation
 splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
 dataset_name: Dataset701_OAIKnee
 
-# --- unannotated-pool supervision ---
-unannotated_mode: distribution
-lambda_dist: 1.0
-dist_n_eff: 64
-dist_k_mean: 2.0
-dist_rel_std_tol: 0.25
-constraint_report_every: 5
-collapse_log_every_n_vals: 5
-
 # --- weak-annotation ablation ---
 annotated_fraction: 0.3
 annotation_seed: 0
 fixed_center: auto
+
+# --- concentration ("do not smear") ---
+lambda_concentration: 1.0
+concentration_classes: [2, 4]      # cartilage only; bones are already peaked
+concentration_tolerance: 0.25      # target concentration >= 0.75
+concentration_warmup_start: 20     # let volume/centroid place the mass first
+concentration_warmup_end: 60
+
+# --- unannotated pool ---
+unannotated_mode: bank
+# withheld cases are pinned to the population mean, so their band must cover
+# the anatomical spread (~90% coverage over the 107 annotated). The annotated
+# cases keep the tight volume/centroid tolerances below.
+bank_volume_tolerance: 0.40
+bank_centroid_tolerance: 0.15
+budget_epoch: 75
+collapse_log_every_n_vals: 5
+
+constraint_sat_every_n_steps: 1
+constraint_report_every: 10
 
 classes: [0, 1, 2, 3, 4]
 
@@ -48,6 +62,7 @@ batch_size: 2
 num_workers: 6
 fg_sampling_prob: 0.5
 
+
 loss: dice_ce_weighted
 smooth_dice_eps: 1.0e-6
 
@@ -55,13 +70,6 @@ optimizer: adam
 lr: 0.0009
 weight_decay: 1.0e-05
 amp: true
-
-# Matched-compute checkpoint: this arm trains on all 356 cases (356 steps/epoch)
-# while A1.1 trains on 107 (106 steps/epoch), so at epoch 75 this run has taken
-# the same ~26.5k updates A1.1 takes in its full 250. Saves one extra file,
-# checkpoint_budget_best.pt (best val model among epochs <= 75, frozen there);
-# normal checkpointing and early stopping are untouched.
-budget_epoch: 75
 
 epochs: 250
 early_stop_patience: 100
@@ -95,7 +103,7 @@ lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
 ##logbarrier toggles
-barrier_t: 5.0
+barrier_t: 70.0        # was 5.0
 # Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
 # It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
 #   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
@@ -111,9 +119,9 @@ barrier_t_mu: 1.0
 barrier_t_max: 100.0
 
 volume_tolerance: 0.10
-centroid_tolerance: 0.05
+centroid_tolerance: 0.012      # was 0.05; keeps stiffness ~200
 avgdist_tolerance: 0.05
-avgdist_axis_tolerance: 0.05
+avgdist_axis_tolerance: 0.012  # was 0.05; achieved error ~0.002
 
 lambda_moment2: 0.0      # 6 covariance components
 lambda_moment3: 0.0       # 10 skewness components, target weight once fully warmed up
@@ -135,5 +143,5 @@ moment_inv_J3_tolerance: 1.0e-5
 
 use_wandb: true
 wandb_project: meunet-shape-supervision
-wandb_run_name: A1.4_dist_ann30
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A1_4_dist_ann30
+wandb_run_name: A2.2_bank_ann30
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A2_2_bank_ann30
