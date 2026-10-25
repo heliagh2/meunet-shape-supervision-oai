@@ -20,6 +20,15 @@ labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentation
 splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
 dataset_name: Dataset701_OAIKnee
 
+# --- distribution figure (diagnostic) ---
+# Logs distribution/{std,exp}_volume: annotated GT (the bank), withheld GT and
+# the predicted distribution on the pool, overlaid, one subplot per class.
+# ORACLE: log_oracle_distribution reads the GT of the WITHHELD cases. It is a
+# separate startup pass used ONLY for the plot -- it never touches the bank, the
+# tolerances or the loss. Do not wire it into anything.
+dist_plot_every_n_epochs: 25
+log_oracle_distribution: true
+
 # --- weak-annotation ablation ---
 annotated_fraction: 0.3
 annotation_seed: 0

@@ -512,17 +512,71 @@ def build_descriptor_bank(cfg, stems, fixed_center, classes, shapes, workdir=Non
             entry["n"] = len(vals)
             bank[patch][str(int(c))] = entry
 
+    # Per-case values, not just the mean/std summary. These are the empirical
+    # distribution the pool is being asked to mirror, and they cost nothing --
+    # they were already computed above and thrown away.
+    samples = {patch: {str(int(c)): {k: [v[k] for v in acc[patch][int(c)]]
+                                     for k in ("frac", "cent", "spread", "avgdist")}
+                       for c in classes}
+               for patch in ("std", "exp")}
+
     meta = {
         "n_stems": len(stems),
         "fixed_center": list(fixed_center) if fixed_center is not None else None,
         "shapes": {k: list(v) for k, v in shapes.items()},
         "classes": [int(c) for c in classes],
     }
-    out = {"meta": meta, "bank": bank}
+    out = {"meta": meta, "bank": bank, "samples": samples}
     if workdir is not None:
         with open(Path(workdir) / "descriptor_bank.json", "w") as f:
             json.dump(out, f, indent=2)
     return out
+
+
+def build_distribution_figure(ann, oracle, pred, patch, classes, class_names=None, key="frac"):
+    """
+    Three distributions of the same descriptor, overlaid, one subplot per class:
+
+      filled   annotated GT   -- the empirical distribution the pool is asked to mirror
+      dashed   unannotated GT -- the real distribution of the withheld cases (ORACLE:
+                                diagnostic only, never touches the bank or the loss)
+      solid    predicted      -- what the model is currently producing on the pool
+
+    The existing sdratio / frac_satisfied metrics only see two moments. This shows
+    shape: a pool can match mean and std while being bimodal, truncated or shifted,
+    and a per-sample population target (A2.2) shows up here as a spike at the mean.
+    """
+    n = len(classes)
+    fig, axes = plt.subplots(2, (n + 1) // 2, figsize=(5 * ((n + 1) // 2), 7))
+    axes = np.atleast_1d(axes).ravel()
+    for i, c in enumerate(classes):
+        ax = axes[i]
+        series = [("annotated GT (bank)", ann, dict(histtype="stepfilled", alpha=.35, color="tab:blue")),
+                  ("unannotated GT (oracle)", oracle, dict(histtype="step", ls="--", lw=2, color="k")),
+                  ("predicted on pool", pred, dict(histtype="step", lw=2, color="tab:red"))]
+        vals = [np.asarray(v[str(int(c))], dtype=float).ravel()
+                for _, v, _ in series if v is not None and str(int(c)) in v]
+        if not vals:
+            ax.set_axis_off(); continue
+        allv = np.concatenate([v for v in vals if v.size])
+        bins = np.linspace(allv.min(), allv.max(), 24) if allv.size > 1 else 12
+        for label, src, kw in series:
+            if src is None or str(int(c)) not in src:
+                continue
+            v = np.asarray(src[str(int(c))], dtype=float).ravel()
+            if v.size:
+                ax.hist(v, bins=bins, density=True, label=label, **kw)
+        nm = (class_names or {}).get(int(c), f"class {c}")
+        ax.set_title(f"{nm} — {key} ({patch.upper()})", fontsize=10)
+        ax.set_xlabel(key); ax.set_yticks([])
+        if i == 0:
+            ax.legend(fontsize=8)
+    for j in range(len(classes), len(axes)):
+        axes[j].set_axis_off()
+    fig.tight_layout()
+    img = wandb.Image(fig)
+    plt.close(fig)
+    return img
 
 
 def bank_tensors(bank, patch, classes, device):
@@ -632,6 +686,7 @@ class DescriptorMomentMatcher:
             loss = loss + w * (barrier(z_mu[:, sl][a]) + barrier(z_sd[:, sl][a]))
 
         stats = {
+            "pred": pred.detach(),
             "z_mu": z_mu.detach(), "z_sd": z_sd.detach(), "active": act,
             "sd_ratio": (sd_hat / tg["sd"]).detach(),
             "mu_hat": mu_hat.detach(), "sd_hat": sd_hat.detach(),
@@ -925,6 +980,7 @@ def compute_concentration_barrier(
     eps=1e-6,
     return_stats=False,
     use_all=None,
+    loss_mask=None,
 ):
     """
     One-sided constraint making the SMEARED solution infeasible.
@@ -966,12 +1022,15 @@ def compute_concentration_barrier(
 
     ctol = _sample_tol(concentration_tolerance, conc.shape[0], device)
     z = (1.0 - ctol) - conc                                      # <= 0 wanted
-    loss = barrier(z.reshape(-1))
+    # loss_mask selects which samples the LOSS is taken over; the stats are
+    # always returned for the whole batch so annotated and label-withheld cases
+    # can be read separately (a batch mean over both is uninterpretable when the
+    # two groups behave differently).
+    z_loss = z if loss_mask is None else z[loss_mask]
+    loss = barrier(z_loss.reshape(-1)) if z_loss.numel() > 0 else logits.new_tensor(0.0)
     if not return_stats:
         return loss
-    with torch.no_grad():
-        per_class = conc.mean(dim=0)
-    return loss, per_class
+    return loss, conc.detach()
 
 
 def compute_centroid_barrier(
@@ -1752,6 +1811,12 @@ def main(cfg_path: str):
     # the dead zone structurally and makes a satisfied term contribute exactly 0.
     # Concentration ("don't smear") constraint. Off by default.
     lambda_concentration = float(cfg.get("lambda_concentration", 0.0))
+    # Whether the concentration constraint also applies to label-withheld cases.
+    # It needs no labels, so it CAN -- but a withheld case has no per-case target
+    # saying WHERE to concentrate (only the pool's aggregate statistics), so
+    # forcing it to commit may just make it confidently wrong, and a confident
+    # error back-propagates harder than a smeared one.
+    conc_on_unannotated = bool(cfg.get("concentration_on_unannotated", True))
     concentration_classes = as_int_list(cfg.get("concentration_classes", []), default=[])
     _ct = cfg.get("concentration_tolerance", 0.25)
     concentration_tolerance = ([float(v) for v in _ct] if isinstance(_ct, (list, tuple))
@@ -1798,6 +1863,10 @@ def main(cfg_path: str):
     bank_classes = sorted(set(volume_classes) | set(centroid_classes)
                           | set(avgdist_classes) | set(avgdist_axis_classes))
     constraint_report_every = int(cfg.get("constraint_report_every", 5))
+
+    # Defined for every run: the figure block below is unconditional.
+    dist_plot_every = int(cfg.get("dist_plot_every_n_epochs", 0))
+    oracle_samples = None
 
     bank = None
     bank_std = bank_exp = None
@@ -1852,6 +1921,20 @@ def main(cfg_path: str):
                 bank = json.load(f)
             if is_main:
                 print(f"[bank] loaded from {bank_src}")
+
+        # ---------------- distribution figure (diagnostic) ----------------
+        # ORACLE WARNING: log_oracle_distribution reads the GT of the WITHHELD
+        # cases -- the labels this whole ablation pretends not to have. It is a
+        # separate pass whose output is used for ONE thing: plotting. It never
+        # touches the bank, the tolerances, the loss, or any config value. Do not
+        # wire it into anything.
+        if dist_plot_every > 0 and bool(cfg.get("log_oracle_distribution", False)) and unannotated_stems:
+            if is_main:
+                print(f"[oracle] reading GT of the {len(unannotated_stems)} WITHHELD cases "
+                      f"for the distribution plot only — not used in training")
+            oracle_samples = build_descriptor_bank(
+                cfg, unannotated_stems, fixed_center, bank_classes, shapes,
+                workdir=None, verbose=False)["samples"]
 
         bank_std = bank_tensors(bank, "std", bank_classes, device)
         bank_exp = bank_tensors(bank, "exp", bank_classes, device)
@@ -1924,6 +2007,10 @@ def main(cfg_path: str):
         loss_sum_dist = 0.0
         conc_sum = 0.0
         conc_val_sum = {int(c): 0.0 for c in concentration_classes}
+        pool_pred = {p_: [] for p_ in PATCH_KEYS}     # predicted descriptors, unannotated pool
+        conc_ann_sum = {int(c): 0.0 for c in concentration_classes}
+        conc_un_sum = {int(c): 0.0 for c in concentration_classes}
+        n_conc_ann = n_conc_un = 0
         grad_norm_sum = 0.0
         grad_clipped = 0.0
         sat_ok = {p: {g: torch.zeros(len(bank_classes), dtype=torch.float64, device=device)
@@ -2075,7 +2162,7 @@ def main(cfg_path: str):
                 moment3_err = logits.new_tensor(0.0)
                 moment_inv_stats = logits.new_zeros(3)  # [err_J1, err_J2, err_J3]
                 conc_loss = logits.new_tensor(0.0)
-                conc_vals = logits.new_zeros(len(concentration_classes)) if concentration_classes else logits.new_zeros(1)
+                conc_vals = None
                 vol_errs = logits.new_zeros(len(volume_classes)) if volume_classes else logits.new_zeros(1)
                 cent_errs_per_class = {int(c): logits.new_tensor(0.0) for c in centroid_classes}
                 m2_errs_per_class = {c: logits.new_tensor(0.0) for c in moment2_classes}
@@ -2120,6 +2207,7 @@ def main(cfg_path: str):
                             logits=logits,
                             target=lbl_rs,
                             use_all=(~has_gt) if not bool(has_gt.all()) else None,
+                            loss_mask=(None if conc_on_unannotated else has_gt),
                             n_classes=cfg["n_classes"],
                             concentration_classes=concentration_classes,
                             barrier=barrier_shape,
@@ -2249,6 +2337,7 @@ def main(cfg_path: str):
                 if matcher is not None and apply_shape and not bool(has_gt.all()):
                     u_idx = (~has_gt).nonzero(as_tuple=False).squeeze(1)
                     if u_idx.numel() > 0:
+                        _collect_pool = True
                         dist_loss, dist_stats = matcher(
                             logits[u_idx], patch_key, barrier_shape,
                             {"volume": lambda_volume, "centroid": lambda_centroid,
@@ -2337,10 +2426,22 @@ def main(cfg_path: str):
                 for _j in range(3):
                     err_sum_axis[patch_key][_j] += float(avgdist_axis_stats[_j].detach())
             conc_sum += float(conc_loss.detach())
-            for _j, _c in enumerate(concentration_classes):
-                conc_val_sum[int(_c)] += float(conc_vals[_j].detach())
+            if conc_vals is not None:
+                _m_ann = has_gt
+                _m_un = ~has_gt
+                for _j, _c in enumerate(concentration_classes):
+                    col = conc_vals[:, _j]
+                    conc_val_sum[int(_c)] += float(col.mean())
+                    if bool(_m_ann.any()):
+                        conc_ann_sum[int(_c)] += float(col[_m_ann].mean()); 
+                    if bool(_m_un.any()):
+                        conc_un_sum[int(_c)] += float(col[_m_un].mean())
+                n_conc_ann += 1 if bool(_m_ann.any()) else 0
+                n_conc_un += 1 if bool(_m_un.any()) else 0
             dist_loss_v = float(dist_loss.detach())
             if dist_stats is not None:
+                if dist_stats.get("pred") is not None:
+                    pool_pred[patch_key].append(dist_stats["pred"].float().cpu())
                 loss_sum_dist += dist_loss_v
                 n_dist += 1
                 dist_last[patch_key] = dist_stats
@@ -2704,6 +2805,23 @@ def main(cfg_path: str):
                     for line in matcher.report(patch, bank_classes):
                         print(line)
 
+        # --- distribution figure: annotated GT vs withheld GT vs predicted ---
+        dist_fig_log = {}
+        if (dist_plot_every > 0 and is_main and use_wandb
+                and (epoch == 1 or epoch % dist_plot_every == 0)):
+            for _pt in PATCH_KEYS:
+                if not pool_pred[_pt]:
+                    continue
+                # (N, C, 7) -> one predicted value per withheld case this epoch
+                _P = torch.cat(pool_pred[_pt], dim=0).numpy()
+                _pred = {str(int(c)): _P[:, i, 0] for i, c in enumerate(bank_classes)}
+                _ann = (None if bank is None else
+                        {k: v["frac"] for k, v in bank["samples"][_pt].items()})
+                _orc = (None if oracle_samples is None else
+                        {k: v["frac"] for k, v in oracle_samples[_pt].items()})
+                dist_fig_log[f"distribution/{_pt}_volume"] = build_distribution_figure(
+                    _ann, _orc, _pred, _pt, bank_classes, viz_class_names, key="volume fraction")
+
         collapse_log = {}
         if do_collapse:
             if use_ddp:
@@ -2800,6 +2918,8 @@ def main(cfg_path: str):
         # scales no longer necessarily holds -- this is the direct read on it.
         conc_tr = conc_sum / max(1, n_it)
         conc_val_tr = {c: conc_val_sum[c] / max(1, n_it) for c in conc_val_sum}
+        conc_ann_tr = {c: conc_ann_sum[c] / max(1, n_conc_ann) for c in conc_ann_sum}
+        conc_un_tr = {c: conc_un_sum[c] / max(1, n_conc_un) for c in conc_un_sum}
         _contribs = {
             "conc": lambda_conc_eff * conc_tr,
             "vol": lambda_volume * loss_tr_vol,
@@ -2938,6 +3058,11 @@ def main(cfg_path: str):
                 "desc/conc_barrier": conc_tr,
                 "schedule/lambda_conc_eff": lambda_conc_eff,
                 **{f"desc/conc_c{c}": v for c, v in conc_val_tr.items()},
+                # split by supervision group: a batch mean over both is
+                # uninterpretable once they diverge
+                **({f"desc/conc_ann_c{c}": v for c, v in conc_ann_tr.items()} if n_conc_ann else {}),
+                **({f"desc/conc_unann_c{c}": v for c, v in conc_un_tr.items()} if n_conc_un else {}),
+                "desc/conc_on_unannotated": float(conc_on_unannotated),
                 **{f"desc/conc_target": (1.0 - (concentration_tolerance
                                                 if not isinstance(concentration_tolerance, list)
                                                 else float(np.mean(concentration_tolerance))))},
@@ -2962,6 +3087,7 @@ def main(cfg_path: str):
                 **soft_log,
                 **viz_log,
                 **collapse_log,
+                **dist_fig_log,
                 **dist_log,
                 **sat_log,
             }, step=epoch)
@@ -3019,8 +3145,10 @@ def main(cfg_path: str):
                 f"(z={loss_tr_avgdist_axis_z:.4f}, y={loss_tr_avgdist_axis_y:.4f}, x={loss_tr_avgdist_axis_x:.4f}) | "
                 # achieved error as a multiple of the tolerance being asked for:
                 # <1 satisfied (and <<1 means the tolerance constrains nothing)
-                + (f"conc=" + "/".join(f"{conc_val_tr[c]:.2f}" for c in sorted(conc_val_tr)) + " | "
-                   if conc_val_tr else "")
+                + (f"conc=" + "/".join(f"{conc_val_tr[c]:.2f}" for c in sorted(conc_val_tr))
+                   + (" ann=" + "/".join(f"{conc_ann_tr[c]:.2f}" for c in sorted(conc_ann_tr)) if n_conc_un else "")
+                   + (" un=" + "/".join(f"{conc_un_tr[c]:.2f}" for c in sorted(conc_un_tr)) if n_conc_un else "")
+                   + " | " if conc_val_tr else "")
                 + f"share vol={_contribs['vol'] / max(_contrib_tot, 1e-12):.2f} "
                 f"cent={_contribs['cent'] / max(_contrib_tot, 1e-12):.2f} "
                 f"axis={_contribs['avgdist_axis'] / max(_contrib_tot, 1e-12):.2f} | "

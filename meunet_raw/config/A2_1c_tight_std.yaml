@@ -1,0 +1,166 @@
+# === A2.1c: tighten the std half of the distribution constraint ===
+# One line different from A2.1: dist_rel_std_tol 0.25 -> 0.10.
+# Branches from A2.1, NOT A2.1b, so it is a single change and the two arms can
+# run in parallel and be attributed independently.
+#
+# Why. The std guard is what distinguishes this method from A2.2 -- it is the
+# term that stops the pool collapsing onto the population mean. But A2.1's logs
+# show it never engaged:
+#     dist/*_sdratio_volume_c2  settled at 0.80-0.90
+#     band at tol 0.25          [0.75, 1.25]      -> inside, z = -0.10, inert
+#     band at tol 0.10          [0.90, 1.10]      -> outside, z = +0.05, binds
+# and dist/frac_satisfied hit 0.95 by epoch 40, so the whole distribution term
+# contributed almost nothing for 210 of 250 epochs. The pool is consistently
+# UNDER-dispersed (85% of the population's spread); this makes that a violation
+# instead of an acceptable state.
+#
+# Dead-zone check: at t=70 the threshold is 1/t^2 = 0.000204 and tol_abs at 0.10
+# is 0.000145, which WOULD be inside it for a two-sided summed barrier. It is
+# safe here because the distribution term uses z = max(z_up, z_lo) -- a single
+# barrier term, not two summed -- so the two sides cannot cancel.
+#
+# Unlike A2.1b this is not aimed at c2; it affects all four classes, and it is
+# the arm that tests whether the method's distinguishing ingredient does any
+# work when it is actually allowed to.
+
+# dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
+
+# data
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+# --- distribution figure (diagnostic) ---
+# Logs distribution/{std,exp}_volume: annotated GT (the bank), withheld GT and
+# the predicted distribution on the pool, overlaid, one subplot per class.
+# ORACLE: log_oracle_distribution reads the GT of the WITHHELD cases. It is a
+# separate startup pass used ONLY for the plot -- it never touches the bank, the
+# tolerances or the loss. Do not wire it into anything.
+dist_plot_every_n_epochs: 25
+log_oracle_distribution: true
+
+# --- weak-annotation ablation ---
+annotated_fraction: 0.3
+annotation_seed: 0
+fixed_center: auto
+
+# --- concentration ("do not smear") ---
+lambda_concentration: 1.0
+concentration_classes: [2, 4]      # cartilage only; bones are already peaked
+concentration_tolerance: 0.25      # target concentration >= 0.75
+concentration_warmup_start: 20     # let volume/centroid place the mass first
+concentration_warmup_end: 60
+
+# --- unannotated pool ---
+unannotated_mode: distribution
+lambda_dist: 1.0
+dist_n_eff: 64
+dist_k_mean: 2.0
+dist_rel_std_tol: 0.10            # was 0.25 — the single change vs A2.1
+budget_epoch: 75
+collapse_log_every_n_vals: 5
+
+constraint_sat_every_n_steps: 1
+constraint_report_every: 10
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200]
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
+#Exp toggles 
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all classes
+desc_only_classes: [1, 2, 3, 4]
+centroid_classes: [1, 2, 3, 4]
+volume_classes: [1, 2, 3, 4]
+avgdist_classes: [1, 2, 3, 4]
+avgdist_axis_classes: [1, 2, 3, 4]
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 1.0              # small now for first experiment logbarrier
+lambda_centroid: 5.0            # small now for first experiment logbarrier
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
+centroid_norm: true             # normalize coords to [0,1]
+
+##logbarrier toggles
+barrier_t: 70.0        # was 5.0
+# Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
+# It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
+#   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
+#     so a scheduled t makes constraint tightness depend on dataset size.
+#   - the barrier switches to its linear extension when |z| < 1/t^2, and that
+#     threshold moves with t (0.040 at t=5, 0.0056 at t=13.4), so a growing t
+#     changes the loss's CHARACTER mid-run, per class, not just its scale.
+# At the fixed t=5, 1/t^2 = 0.040: every volume constraint (effective tolerance
+# 0.10*gt_frac = 0.0007-0.023) sits in the hinge regime for ALL classes, which
+# at least makes them behave uniformly; centroid and avgdist_axis at tol 0.05
+# sit just inside the log region.
+barrier_t_mu: 1.0
+barrier_t_max: 100.0
+
+volume_tolerance: 0.10
+centroid_tolerance: 0.012      # was 0.05; keeps stiffness ~200
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.012  # was 0.05; achieved error ~0.002
+
+lambda_moment2: 0.0      # 6 covariance components
+lambda_moment3: 0.0       # 10 skewness components, target weight once fully warmed up
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
+#lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
+
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 0.05
+moment3_tolerance: 0.01  # updated according to values
+moment_inv_tolerance: 0.01
+
+lambda_moment_inv_J1: 0.0       # disable J1
+lambda_moment_inv_J2: 0.0
+lambda_moment_inv_J3: 0.0
+moment_inv_J1_tolerance: 0.01
+moment_inv_J2_tolerance: 5.0e-4
+moment_inv_J3_tolerance: 1.0e-5
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: A2.1c_tight_std
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A2_1c_tight_std
