@@ -48,6 +48,20 @@ def zscore_nonzero(vol: np.ndarray) -> np.ndarray:
     return (vol - m) / s
 
 
+# zscore_nonzero is right for OAI MRI, whose background is exactly 0. It is wrong
+# for CT, where "non-zero" is everything except water-density voxels, so AMOS is
+# normalised once offline (data/preprocess_amos.py) and loaded with "none".
+INTENSITY_NORMS = ("zscore_nonzero", "none")
+
+
+def normalize_intensity(vol: np.ndarray, mode: str = "zscore_nonzero") -> np.ndarray:
+    if mode == "zscore_nonzero":
+        return zscore_nonzero(vol)
+    if mode == "none":
+        return vol.astype(np.float32)
+    raise ValueError(f"unknown intensity_norm {mode!r}; expected one of {INTENSITY_NORMS}")
+
+
 def _compute_patch_bounds(center: int, size: int, max_size: int):
     """
     Given a center index, patch size and full size, return [start, end)
@@ -173,6 +187,7 @@ class OAIPairedPatch(Dataset):
         train: bool = True, # kept in signature for compatibility
         fixed_center=None,  # None -> legacy per-case GT foreground centre
         annotated_stems=None,  # None -> every case is annotated (legacy)
+        intensity_norm="zscore_nonzero",  # "none" for data normalised offline (AMOS)
     ):
         self.images_dir = Path(images_dir)
         self.labels_dir = Path(labels_dir)
@@ -190,6 +205,9 @@ class OAIPairedPatch(Dataset):
         self.expand_factor = float(expand_factor) if expand_factor is not None else None
         self.fg_sampling_prob = float(fg_sampling_prob)  # not used, kept for compatibility
         self.train = bool(train)
+        self.intensity_norm = str(intensity_norm).lower()
+        if self.intensity_norm not in INTENSITY_NORMS:
+            raise ValueError(f"intensity_norm must be one of {INTENSITY_NORMS}, got {intensity_norm!r}")
         self.image_suffixes = ("_0000", "")
         self.label_suffixes = ("", "_segmentation")
 
@@ -225,7 +243,7 @@ class OAIPairedPatch(Dataset):
         img = img_nii.get_fdata().astype(np.float32)
         lbl = lbl_nii.get_fdata().astype(np.int16)
 
-        img = zscore_nonzero(img)
+        img = normalize_intensity(img, self.intensity_norm)
         return img, lbl
 
     def _precompute_fixed_centers(self):

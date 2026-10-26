@@ -124,10 +124,11 @@ def load_or_create_test_split(cfg, images_dir: Path):
 
 
 @torch.no_grad()
-def predict_case(img_path, out_path, stage1, device, n_classes):
+def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="zscore_nonzero"):
     img_nii = nib.load(str(img_path))
     img = img_nii.get_fdata()  # (Z,Y,X)
-    img = preprocess_volume(img)
+    # must match training: AMOS is normalised offline (intensity_norm: none)
+    img = preprocess_volume(img) if intensity_norm == "zscore_nonzero" else img.astype(np.float32)
 
     # (1,1,D,H,W)
     img_t = torch.from_numpy(img[None, None, ...]).to(device)
@@ -193,7 +194,8 @@ def main():
         out_name = img_path.name.replace("_0000", "")
         out_path = out_dir / out_name
         print(f"[{i:03d}/{len(img_paths):03d}] {img_path.name} -> {out_name}")
-        predict_case(img_path, out_path, stage1, device, n_classes)
+        predict_case(img_path, out_path, stage1, device, n_classes,
+                     intensity_norm=str(cfg.get("intensity_norm", "zscore_nonzero")).lower())
 
     print("[INFO] Done stage-1 inference.")
 

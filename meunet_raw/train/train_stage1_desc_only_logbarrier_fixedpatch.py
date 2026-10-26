@@ -117,12 +117,21 @@ _VIZ_CLASS_COLORS = {
 }
 
 
+def _viz_color(c):
+    # knee classes keep their fixed colours; anything else (AMOS has 15) falls
+    # back to tab20, so multi-organ overlays are not silently left undrawn
+    if c in _VIZ_CLASS_COLORS:
+        return _VIZ_CLASS_COLORS[c]
+    return matplotlib.colormaps["tab20"](int(c) % 20)[:3]
+
+
 def _draw_mask_overlay(ax, img, mask, class_names, alpha=0.45):
     ax.imshow(img, cmap="gray", vmin=0, vmax=1)
     rgba = np.zeros((*mask.shape, 4), dtype=np.float32)
-    for c, color in _VIZ_CLASS_COLORS.items():
-        if c not in class_names:
+    for c in class_names:
+        if int(c) == 0:
             continue
+        color = _viz_color(int(c))
         m = mask == c
         rgba[m, 0:3] = color
         rgba[m, 3] = alpha
@@ -155,11 +164,11 @@ def build_viz_wandb_image(img_slice, gt_slice, pred_slice, class_names):
     axes[2].set_title("prediction", fontsize=9)
 
     handles = [
-        matplotlib.patches.Patch(color=color, label=class_names.get(c, str(c)))
-        for c, color in _VIZ_CLASS_COLORS.items()
-        if c in class_names
+        matplotlib.patches.Patch(color=_viz_color(int(c)), label=name)
+        for c, name in class_names.items()
+        if int(c) != 0
     ]
-    fig.legend(handles=handles, loc="lower center", ncol=len(handles), fontsize=8, frameon=False)
+    fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 8), fontsize=8, frameon=False)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
 
     fig.canvas.draw()
@@ -475,6 +484,7 @@ def build_descriptor_bank(cfg, stems, fixed_center, classes, shapes, workdir=Non
         cfg["patch_size"], float(cfg.get("expand_factor", 1.25)),
         float(cfg.get("fg_sampling_prob", 0.5)), False,
         fixed_center=fixed_center,
+        intensity_norm=cfg.get("intensity_norm", "zscore_nonzero"),
     )
 
     acc = {p: {int(c): [] for c in classes} for p in ("std", "exp")}
@@ -740,6 +750,7 @@ def make_loader(cfg, stems, train: bool, sampler=None, fixed_center=None, annota
         train,
         fixed_center=fixed_center,
         annotated_stems=annotated_stems,
+        intensity_norm=cfg.get("intensity_norm", "zscore_nonzero"),
     )
 
     loader = DataLoader(
@@ -1509,10 +1520,12 @@ def main(cfg_path: str):
         tr_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], tr_stems,
                                cfg["patch_size"], expand_factor, fg_prob, True,
                                fixed_center=fixed_center,
-                               annotated_stems=(annotated_stems if unannotated_mode != "drop" else None))
+                               annotated_stems=(annotated_stems if unannotated_mode != "drop" else None),
+                               intensity_norm=cfg.get("intensity_norm", "zscore_nonzero"))
         va_ds = OAIPairedPatch(cfg["images_dir"], cfg["labels_dir"], va_stems,
                                cfg["patch_size"], expand_factor, fg_prob, False,
-                               fixed_center=fixed_center)
+                               fixed_center=fixed_center,
+                               intensity_norm=cfg.get("intensity_norm", "zscore_nonzero"))
         train_sampler = DistributedSampler(tr_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
         val_sampler   = DistributedSampler(va_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
         train_loader  = DataLoader(tr_ds, batch_size=int(cfg["batch_size"]), sampler=train_sampler,
@@ -1767,6 +1780,7 @@ def main(cfg_path: str):
                     cfg["images_dir"], cfg["labels_dir"], [viz_stem],
                     cfg["patch_size"], expand_factor, fg_prob, False,
                     fixed_center=fixed_center,
+                    intensity_norm=cfg.get("intensity_norm", "zscore_nonzero"),
                 )
                 viz_sample = viz_ds[0]
                 viz_slice_idx = select_viz_slice(

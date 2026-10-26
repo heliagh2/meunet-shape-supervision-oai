@@ -1,0 +1,171 @@
+# === A1.11: A1.5 + a concentration constraint on the cartilage ===  [AMOS22 CT]
+#
+# AMOS22 CT port of the OAI config of the same name. The METHOD is unchanged:
+# t, tolerances, lambdas, warmups and (where present) n_eff/budget_epoch are the
+# OAI values verbatim. Only the dataset-dependent keys differ:
+#   data       preprocessed by data/preprocess_amos.py: RAS, 1.5x1.5x3.0 mm,
+#              320x256x224 grid centred on the body, CT window [-175,250] HU ->
+#              [-1,1]. intensity_norm: none -- the loader must not re-normalise.
+#   split      official imagesTr CT (200) -> 180 train / 20 val (stratified by
+#              manufacturer); official imagesVa CT (100) -> held-out test.
+#              30% of 180 = 54 annotated, 126 withheld (OAI: 107 / 249).
+#   classes    16 (bg + 15 organs), every organ constrained.
+#   patch      STD [224,192,192] = 336x288x576 mm (8.3M vox, OAI was 8.0M). At the
+#              auto centre every organ is fully inside in >=98% of train cases
+#              except bladder (99% present / 79% whole) and prostate/uterus (92% /
+#              77%) at the pelvic end. EXP (expand 2.0) asks for more than the
+#              grid, is clipped to the whole 320x256x224 volume and resampled to
+#              the STD shape, so EXP = the whole scan at ~1.4x coarser.
+#   concentration  the small / thin organs (gallbladder, esophagus, pancreas,
+#              both adrenals, duodenum) -- the AMOS analogue of the cartilage.
+#              A GUESS, not a measurement: check soft/*_hard_over_soft_c* after a
+#              first run and add any class that smears.
+#   tolerances centroid/spread 0.012 are in normalised patch units, carried over
+#              from OAI. The AMOS patch is larger in mm, so the same number is a
+#              looser band anatomically (~3.5 mm in-plane, ~7 mm in z).
+
+# (original OAI header: config/A1_11_concentration.yaml)
+
+# data (AMOS22 CT, preprocessed)
+images_dir: /projects/0/prjs1400/AMOS/amos22_meunet_ct/images
+labels_dir: /projects/0/prjs1400/AMOS/amos22_meunet_ct/labels
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset702_AMOS_CT/splits_final.json
+dataset_name: Dataset702_AMOS_CT
+intensity_norm: none
+
+# --- weak-annotation ablation ---
+annotated_fraction: 0.3
+annotation_seed: 0
+fixed_center: auto
+
+# --- concentration ("do not smear") ---
+lambda_concentration: 1.0
+concentration_classes: [4, 5, 10, 11, 12, 13]  # small/thin organs (see header)
+concentration_tolerance: 0.25      # target concentration >= 0.75
+concentration_warmup_start: 20     # let volume/centroid place the mass first
+concentration_warmup_end: 60
+
+constraint_sat_every_n_steps: 1
+constraint_report_every: 10
+
+classes: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+# model
+in_channels: 1
+n_classes: 16
+patch_size: [224, 192, 192]     # (x, y, z) on the RAS grid; see header
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+viz_slice_axis: 2                  # RAS grid: axis 2 = axial slices
+viz_cartilage_classes: [10, 11, 12]  # slice that best shows pancreas + adrenals
+viz_class_names:
+  0: background
+  1: spleen
+  2: right_kidney
+  3: left_kidney
+  4: gallbladder
+  5: esophagus
+  6: liver
+  7: stomach
+  8: aorta
+  9: postcava
+  10: pancreas
+  11: right_adrenal
+  12: left_adrenal
+  13: duodenum
+  14: bladder
+  15: prostate_uterus
+
+#Exp toggles 
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all 15 organs
+desc_only_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+centroid_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+volume_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+avgdist_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+avgdist_axis_classes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+shape_on: both                  # apply shape losses on EXP and STD patches
+
+lambda_volume: 1.0              # small now for first experiment logbarrier
+lambda_centroid: 5.0            # small now for first experiment logbarrier
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
+centroid_norm: true             # normalize coords to [0,1]
+
+##logbarrier toggles
+barrier_t: 70.0        # was 5.0
+# Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
+# It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
+#   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
+#     so a scheduled t makes constraint tightness depend on dataset size.
+#   - the barrier switches to its linear extension when |z| < 1/t^2, and that
+#     threshold moves with t (0.040 at t=5, 0.0056 at t=13.4), so a growing t
+#     changes the loss's CHARACTER mid-run, per class, not just its scale.
+# At the fixed t=5, 1/t^2 = 0.040: every volume constraint (effective tolerance
+# 0.10*gt_frac = 0.0007-0.023) sits in the hinge regime for ALL classes, which
+# at least makes them behave uniformly; centroid and avgdist_axis at tol 0.05
+# sit just inside the log region.
+barrier_t_mu: 1.0
+barrier_t_max: 100.0
+
+volume_tolerance: 0.10
+centroid_tolerance: 0.012      # was 0.05; keeps stiffness ~200
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.012  # was 0.05; achieved error ~0.002
+
+lambda_moment2: 0.0      # 6 covariance components
+lambda_moment3: 0.0       # 10 skewness components, target weight once fully warmed up
+moment3_classes: []          # AMOS: lambda_moment3 is 0, but the trainer computes moment3 for every
+                              # listed class regardless (0 x loss still builds the graph) -- 15 classes
+                              # of wasted memory/time per step. Empty list skips it.
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
+#lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
+
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 0.05
+moment3_tolerance: 0.01  # updated according to values
+moment_inv_tolerance: 0.01
+
+lambda_moment_inv_J1: 0.0       # disable J1
+lambda_moment_inv_J2: 0.0
+lambda_moment_inv_J3: 0.0
+moment_inv_J1_tolerance: 0.01
+moment_inv_J2_tolerance: 5.0e-4
+moment_inv_J3_tolerance: 1.0e-5
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: AMOS_A1.11_concentration
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/AMOS_A1_11_concentration
