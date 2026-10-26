@@ -6,6 +6,7 @@ import glob
 import numpy as np
 import nibabel as nib
 import csv
+import json
 
 
 def normalize_case_name(path_or_name):
@@ -19,6 +20,21 @@ def normalize_case_name(path_or_name):
     if name.endswith("_segmentation"):
         name = name[:-13]
     return name
+
+
+def load_case_ids(path):
+    """Case ids from {"test": [...]}, a plain list, or nnUNet splits ([{"train","val"}] -> val)."""
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        ids = data.get("test") or data.get("test_ids") or data.get("val")
+    elif isinstance(data, list) and data and isinstance(data[0], dict):
+        ids = data[0].get("val")
+    else:
+        ids = data
+    if not ids:
+        raise KeyError(f"no case ids found in {path}")
+    return {normalize_case_name(str(i)) for i in ids}
 
 
 def dice_per_class(gt, pred, labels):
@@ -43,9 +59,15 @@ def main():
     ap.add_argument("--pred_dir", required=True, help="Directory with predicted labels (.nii / .nii.gz)")
     ap.add_argument("--out_csv", default=None, help="Optional CSV file to save per-case Dice")
     ap.add_argument("--labels", nargs="+", type=int, default=[1, 2, 3, 4], help="Foreground label IDs")
+    ap.add_argument("--cases_json", default=None,
+                    help="Optional: only evaluate these cases (splits_test_final.json, a list, or nnUNet splits -> val)")
     args = ap.parse_args()
 
     gt_files = sorted(glob.glob(os.path.join(args.gt_dir, "*.nii*")))
+    if args.cases_json:
+        keep = load_case_ids(args.cases_json)
+        gt_files = [p for p in gt_files if normalize_case_name(p) in keep]
+        print(f"[INFO] Restricted to {len(gt_files)} GT files listed in {args.cases_json}")
     if not gt_files:
         raise RuntimeError(f"No GT files found in {args.gt_dir}")
 

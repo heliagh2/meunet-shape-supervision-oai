@@ -124,7 +124,7 @@ def load_or_create_test_split(cfg, images_dir: Path):
 
 
 @torch.no_grad()
-def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="zscore_nonzero"):
+def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="zscore_nonzero", amp=False):
     img_nii = nib.load(str(img_path))
     img = img_nii.get_fdata()  # (Z,Y,X)
     # must match training: AMOS is normalised offline (intensity_norm: none)
@@ -133,7 +133,8 @@ def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="
     # (1,1,D,H,W)
     img_t = torch.from_numpy(img[None, None, ...]).to(device)
 
-    out = stage1(img_t, expanded=False)["logit1"]   # (1,C,D,H,W)
+    with torch.autocast(device_type=device.type, enabled=amp):
+        out = stage1(img_t, expanded=False)["logit1"]   # (1,C,D,H,W)
     pred = out.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int16)
 
     pred_nii = nib.Nifti1Image(pred, img_nii.affine, img_nii.header)
@@ -147,6 +148,8 @@ def main():
     ap.add_argument("--images_dir", required=True, help="Directory with test images (.nii.gz)")
     ap.add_argument("--output_dir", required=True, help="Where to save predicted segmentations")
     ap.add_argument("--device", default="cuda", help="cuda or cpu")
+    ap.add_argument("--amp", action="store_true",
+                    help="autocast the forward pass (halves activation memory for large whole-volume inputs)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -195,7 +198,8 @@ def main():
         out_path = out_dir / out_name
         print(f"[{i:03d}/{len(img_paths):03d}] {img_path.name} -> {out_name}")
         predict_case(img_path, out_path, stage1, device, n_classes,
-                     intensity_norm=str(cfg.get("intensity_norm", "zscore_nonzero")).lower())
+                     intensity_norm=str(cfg.get("intensity_norm", "zscore_nonzero")).lower(),
+                     amp=args.amp)
 
     print("[INFO] Done stage-1 inference.")
 
