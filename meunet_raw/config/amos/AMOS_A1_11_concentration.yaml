@@ -29,7 +29,7 @@
 # data (AMOS22 CT, preprocessed)
 images_dir: /projects/0/prjs1400/AMOS/amos22_meunet_ct/images
 labels_dir: /projects/0/prjs1400/AMOS/amos22_meunet_ct/labels
-splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset702_AMOS_CT/splits_final.json
+splits_file: /home/isimion1/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset702_AMOS_CT/splits_final.json
 dataset_name: Dataset702_AMOS_CT
 intensity_norm: none
 
@@ -168,4 +168,4 @@ moment_inv_J3_tolerance: 1.0e-5
 use_wandb: true
 wandb_project: meunet-shape-supervision
 wandb_run_name: AMOS_A1.11_concentration
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/AMOS_A1_11_concentration
+workdir: /home/isimion1/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/AMOS_A1_11_concentration

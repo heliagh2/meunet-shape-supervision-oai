@@ -1,0 +1,13 @@
+#!/bin/bash
+#SBATCH --job-name=env
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=02:00:00
+#SBATCH --chdir=/home/isimion1/meunet-shape-supervision-oai/meunet_raw
+#SBATCH --output=logs/env-%j.out
+#SBATCH --error=logs/env-%j.err
+
+

@@ -9,15 +9,15 @@
 # PREP_DIR must be writable and must match images_dir/labels_dir in
 # config/amos/*.yaml. ~300 CT cases -> roughly 4 GB.
 #SBATCH --job-name=amos-prep
-#SBATCH --account=gisr107588
-#SBATCH --partition=genoa
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --chdir=/home/isimion/meunet-shape-supervision-oai/meunet_raw
-#SBATCH --output=logs/%x-%j.out
-#SBATCH --error=logs/%x-%j.err
+#SBATCH --chdir=/home/isimion1/meunet-shape-supervision-oai/meunet_raw
+#SBATCH --output=logs/prep_amos-%j.out
+#SBATCH --error=logs/prep_amos-%j.err
 
 set -euo pipefail
 
@@ -25,10 +25,12 @@ AMOS_ROOT=/projects/0/prjs1400/AMOS/amos22
 META_CSV=/projects/0/prjs1400/AMOS/labeled_data_meta_0000_0599.csv
 PREP_DIR=/projects/0/prjs1400/AMOS/amos22_meunet_ct
 
+set -euo pipefail
+
 module purge
-module load 2023
-module load PyTorch/2.1.2-foss-2023a-CUDA-12.1.1
-source ~/venvs/oai-baseline/bin/activate
+
+# Activate your CUDA-12 venv
+source ~/envs/medshape/bin/activate
 
 # splits are committed in nnunet/nnUNet_preprocessed/Dataset702_AMOS_CT/ and are
 # deterministic; pass --splits_dir to regenerate them.
