@@ -22,6 +22,10 @@ CONFIG=${1:?usage: sbatch slurm/amos/train_amos.sbatch config/amos/<name>.yaml}
 
 module purge
 source ~/envs/medshape/bin/activate
+
+export WANDB_ENTITY="i-simion-university-of-amsterdam"
+source ~/.secrets/wandb.env
+
 python -u train/train_stage1_desc_only_logbarrier_fixedpatch.py --config "$CONFIG"
 
 echo "=== Done AMOS run: $CONFIG ==="
