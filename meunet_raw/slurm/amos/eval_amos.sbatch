@@ -4,7 +4,6 @@
 #
 #   sbatch -J eval-A2.1 slurm/amos/eval_amos.sbatch config/amos/AMOS_A2_1_distribution.yaml
 #   sbatch -J eval-A2.1-budget slurm/amos/eval_amos.sbatch config/amos/AMOS_A2_1_distribution.yaml checkpoint_budget_best.pt
-#   SANITY=1 sbatch slurm/amos/eval_amos.sbatch config/amos/AMOS_A0_concentration.yaml   # + mapping check (run once)
 #
 # Steps:
 #   1. whole-volume inference on the canonical grid (as for OAI: logit1, argmax)
@@ -13,10 +12,7 @@
 #   4. Dice vs the ORIGINAL AMOS labels -> <workdir>/test_<ckpt>_dice_native.csv
 #      (native is the number to report; grid is the number comparable to val Dice)
 #
-# SANITY=1 first maps the preprocessed GROUND TRUTH back to native space and
-# scores it against the original labels. Dice there should be ~0.95+ for large
-# organs; anything much lower means the grid->native mapping is broken and
-# step 4 cannot be trusted. Only needs doing once.
+# The grid -> native mapping is checked separately, once: slurm/amos/sanity_amos.sbatch
 #SBATCH --job-name=amos-eval
 #SBATCH --partition=gpu_h100
 #SBATCH --gres=gpu:1
@@ -53,22 +49,6 @@ PRED_GRID="$WORKDIR/${TAG}_preds_grid"
 PRED_NATIVE="$WORKDIR/${TAG}_preds_native"
 echo "config=$CONFIG ckpt=$WORKDIR/$CKPT_NAME test=$TEST_JSON"
 
-if [[ "${SANITY:-0}" == "1" ]]; then
-  echo "=== SANITY: preprocessed GT -> native vs original labels ==="
-  SAN=$(mktemp -d)
-  python - "$TEST_JSON" "$LABELS_DIR" "$SAN/gt_grid" <<'EOF'
-import sys, json, shutil
-from pathlib import Path
-ids = json.load(open(sys.argv[1]))["test"]
-out = Path(sys.argv[3]); out.mkdir(parents=True)
-for s in ids:
-    shutil.copy(Path(sys.argv[2]) / f"{s}.nii.gz", out / f"{s}.nii.gz")
-EOF
-  python -u eval/amos_to_native.py --pred_dir "$SAN/gt_grid" --amos_root "$AMOS_ROOT" --out_dir "$SAN/gt_native" > /dev/null
-  python -u eval/eval_dice_oai.py --gt_dir "$AMOS_ROOT/labelsVa" --pred_dir "$SAN/gt_native" \
-    --labels $LABELS --cases_json "$TEST_JSON" --out_csv "$WORKDIR/sanity_gt_roundtrip_dice.csv"
-  rm -rf "$SAN"
-fi
 
 echo "=== 1. inference ($CKPT_NAME) ==="
 python -u eval/infer_stage1_oai.py \
