@@ -123,8 +123,24 @@ def load_or_create_test_split(cfg, images_dir: Path):
     return test_ids
 
 
+def check_exp_covers_volume(vol_shape, patch_size, expand_factor):
+    """
+    The EXP head was trained on the expanded box (patch * expand_factor) around a
+    per-case centre, clipped to the volume and resized to patch_size. When that box
+    covers the whole volume on every axis (AMOS: 448x384x384 vs a 320x256x224
+    grid), the training input was simply the whole scan resized to patch_size, and
+    inference can reproduce it exactly. Otherwise it would need the training centre.
+    """
+    exp = [int(round(p * expand_factor)) for p in patch_size]
+    if any(e < s for e, s in zip(exp, vol_shape)):
+        raise ValueError(
+            f"--head exp needs the expanded box {exp} to cover the whole volume {list(vol_shape)}; "
+            f"with a smaller box the EXP input depends on the training patch centre")
+
+
 @torch.no_grad()
-def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="zscore_nonzero", amp=False):
+def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="zscore_nonzero", amp=False,
+                 head="std", patch_size=None, expand_factor=None):
     img_nii = nib.load(str(img_path))
     img = img_nii.get_fdata()  # (Z,Y,X)
     # must match training: AMOS is normalised offline (intensity_norm: none)
@@ -134,7 +150,15 @@ def predict_case(img_path, out_path, stage1, device, n_classes, intensity_norm="
     img_t = torch.from_numpy(img[None, None, ...]).to(device)
 
     with torch.autocast(device_type=device.type, enabled=amp):
-        out = stage1(img_t, expanded=False)["logit1"]   # (1,C,D,H,W)
+        if head == "std":
+            out = stage1(img_t, expanded=False)["logit1"]   # (1,C,D,H,W)
+        else:
+            # EXP head: whole scan -> patch_size (as the EXP training patch), logit2
+            # at half that resolution, logits upsampled back to the scan grid
+            check_exp_covers_volume(img.shape, patch_size, expand_factor)
+            x = F.interpolate(img_t, size=tuple(patch_size), mode="trilinear", align_corners=False)
+            out = stage1(x, expanded=True)["logit2"]
+            out = F.interpolate(out.float(), size=img.shape, mode="trilinear", align_corners=False)
     pred = out.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int16)
 
     pred_nii = nib.Nifti1Image(pred, img_nii.affine, img_nii.header)
@@ -150,6 +174,9 @@ def main():
     ap.add_argument("--device", default="cuda", help="cuda or cpu")
     ap.add_argument("--amp", action="store_true",
                     help="autocast the forward pass (halves activation memory for large whole-volume inputs)")
+    ap.add_argument("--head", choices=("std", "exp"), default="std",
+                    help="std: logit1 on the full-res volume (default). "
+                         "exp: logit2 on the volume resized like the EXP training patch")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -191,7 +218,7 @@ def main():
                 f"No test images left in {images_dir} after filtering by splits_test_final.json logic."
             )
 
-    print(f"[INFO] Running stage-1 inference on {len(img_paths)} volumes from {images_dir}")
+    print(f"[INFO] Running stage-1 inference ({args.head} head) on {len(img_paths)} volumes from {images_dir}")
     for i, img_path in enumerate(img_paths, 1):
         # strip _0000 so filenames match labelsTs directly
         out_name = img_path.name.replace("_0000", "")
@@ -199,7 +226,8 @@ def main():
         print(f"[{i:03d}/{len(img_paths):03d}] {img_path.name} -> {out_name}")
         predict_case(img_path, out_path, stage1, device, n_classes,
                      intensity_norm=str(cfg.get("intensity_norm", "zscore_nonzero")).lower(),
-                     amp=args.amp)
+                     amp=args.amp, head=args.head, patch_size=cfg.get("patch_size"),
+                     expand_factor=float(cfg.get("expand_factor", 1.25)))
 
     print("[INFO] Done stage-1 inference.")
 
