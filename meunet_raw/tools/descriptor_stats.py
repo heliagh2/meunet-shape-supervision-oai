@@ -18,6 +18,13 @@ this prints is what the run will be constrained by.
             more than the tolerance allows, and the method is asked to push the
             pool AWAY from its real distribution.
 
+Also prints the barrier_t needed to keep every per-case GT constraint out of the
+log-barrier dead zone (t > 1/sqrt(band); for volume, band = volume_tolerance *
+smallest per-case gt_frac at each head's resolution), unless constraint_normalize.
+Reported twice: for the annotated cases only (what a fractional run supervises
+per case) and for the full train pool (annotated + withheld GT, as a run with
+every case annotated would see).
+
 Needs no GPU. Usage:
   python tools/descriptor_stats.py --config config/amos/AMOS_A2_1_distribution.yaml [--oracle] [--out stats.json]
 """
@@ -72,11 +79,91 @@ def pool_stats(samples, classes):
     return np.asarray(mu), np.asarray(sd)
 
 
+def t_for_band(band):
+    """Smallest barrier t for which a two-sided constraint with absolute half-band
+    `band` is live. LogBarrierLoss switches to its linear extension for
+    z > -1/t^2; at the target both sides sit at z = -band, so if band < 1/t^2 both
+    are linear, their slopes +t and -t cancel, and the constraint gives no
+    gradient however wrong it is. Live needs band > 1/t^2, i.e. t > 1/sqrt(band)."""
+    return 1.0 / np.sqrt(band)
+
+
+def barrier_t_report(cfg, samples, nm, margin, title):
+    """
+    Raw-z (constraint_normalize: false) rule for barrier_t, per-case GT constraints.
+
+    Volume's band is volume_tolerance * gt_frac PER CASE, at each head's own
+    resolution, so the binding case is the smallest fraction of the smallest
+    class in either patch -- not a class mean. Centroid / spread / concentration
+    bands are absolute config values. The distribution matcher (A2.1 pool) uses a
+    one-sided max() form and has no dead zone, so it does not enter this rule.
+    """
+    t_cfg = float(cfg.get("barrier_t", 5.0))
+    vol_classes = as_int_list(cfg.get("volume_classes", cfg.get("desc_only_classes", [])))
+    vt = cfg.get("volume_tolerance", 0.10)
+    vtol = ({int(c): float(v) for c, v in zip(vol_classes, vt)} if isinstance(vt, (list, tuple))
+            else {int(c): float(vt) for c in vol_classes})
+
+    out = {"barrier_t": t_cfg, "margin": margin, "volume": {}}
+    print(f"\n=== barrier_t [{title}]: dead-zone rule t > 1/sqrt(band)  (config t={t_cfg:g}, live for "
+          f"band > 1/t^2 = {1 / t_cfg ** 2:.2e}) ===")
+    print("volume, band = volume_tolerance * gt_frac per case (present cases only):")
+    print(f"  {'class':<18}{'patch':>6}{'n':>5}{'min frac':>11}{'p5 frac':>10}{'median':>10}"
+          f"{'t (all)':>10}{'t (95%)':>10}{'dead @cfg t':>13}")
+    worst_all, worst_p95 = (0.0, None), (0.0, None)
+    for c in vol_classes:
+        for patch in ("std", "exp"):
+            f = np.asarray(samples[patch][str(int(c))]["frac"], dtype=np.float64)
+            f = f[f > 0]
+            if f.size == 0:
+                continue
+            tol = vtol[int(c)]
+            t_all = t_for_band(tol * f.min())
+            t_95 = t_for_band(tol * np.percentile(f, 5))
+            dead = float(np.mean(tol * f < 1 / t_cfg ** 2))
+            print(f"  {nm(c):<18}{patch:>6}{f.size:>5}{f.min():>11.2e}{np.percentile(f, 5):>10.2e}"
+                  f"{np.median(f):>10.2e}{t_all:>10.1f}{t_95:>10.1f}{100 * dead:>12.0f}%")
+            out["volume"].setdefault(str(int(c)), {})[patch] = {
+                "n": int(f.size), "min_frac": float(f.min()), "p5_frac": float(np.percentile(f, 5)),
+                "median_frac": float(np.median(f)), "t_all": float(t_all), "t_95": float(t_95),
+                "dead_frac_at_cfg_t": dead}
+            if t_all > worst_all[0]:
+                worst_all = (t_all, f"{nm(c)} {patch}")
+            if t_95 > worst_p95[0]:
+                worst_p95 = (t_95, f"{nm(c)} {patch}")
+
+    other = {}
+    if float(cfg.get("lambda_centroid", 0.0)) > 0:
+        other["centroid"] = float(cfg.get("centroid_tolerance", 0.05))
+    if float(cfg.get("lambda_avgdist_axis", 0.0)) > 0:
+        other["spread (avgdist_axis)"] = float(cfg.get("avgdist_axis_tolerance", 0.05))
+    if float(cfg.get("lambda_avgdist", 0.0)) > 0:
+        other["avgdist"] = float(cfg.get("avgdist_tolerance", 0.05))
+    if float(cfg.get("lambda_concentration", 0.0)) > 0:
+        ct = cfg.get("concentration_tolerance", 0.25)
+        other["concentration (one-sided)"] = min(ct) if isinstance(ct, (list, tuple)) else float(ct)
+    for k, band in other.items():
+        t_min = t_for_band(band)
+        note = "  (one-sided: no cancellation, listed for reference)" if "one-sided" in k else ""
+        print(f"  {k:<28} band {band:g} -> t > {t_min:.1f}{note}")
+        out[k] = {"band": band, "t_min": float(t_min)}
+
+    out["t_all"], out["t_all_from"] = float(worst_all[0]), worst_all[1]
+    out["t_95"], out["t_95_from"] = float(worst_p95[0]), worst_p95[1]
+    print(f"\n  every case live           : t > {worst_all[0]:.1f}   (set by {worst_all[1]})")
+    print(f"  95% of cases per class    : t > {worst_p95[0]:.1f}   (set by {worst_p95[1]})")
+    print(f"  {f'with x{margin:g} margin':<26}: barrier_t ~ {margin * worst_all[0]:.0f} (all) / "
+          f"{margin * worst_p95[0]:.0f} (95%)")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True)
     ap.add_argument("--oracle", action="store_true", help="also read withheld GT (diagnostic only)")
     ap.add_argument("--out", default=None, help="write everything to this JSON")
+    ap.add_argument("--t_margin", type=float, default=1.2,
+                    help="safety factor on the minimum barrier_t in the dead-zone report")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -134,6 +221,33 @@ def main():
                 print(f"{'':<18}  ^ absent from {len(ann) - e['n']} annotated {patch} patches: the bank "
                       f"averages present cases only, but the pool loss sees every case")
 
+    # Withheld-case GT: diagnostic only (never used by training). Read once and
+    # shared by the full-pool barrier_t report and the --oracle check.
+    wbank = None
+    if withheld:
+        print(f"\nreading the GT of the {len(withheld)} withheld cases (diagnostic only) ...")
+        wbank = build_descriptor_bank(cfg, withheld, fc, classes, shapes, workdir=None, verbose=False)
+
+    # Two answers: the annotated cases are the ones that carry per-case GT
+    # constraints in a 30% run (and so decide its dead zone); the full train pool
+    # is what a run with every case annotated would see.
+    if cfg.get("constraint_normalize", False):
+        print("\n[barrier_t] constraint_normalize: true -- bands are 1 in normalised units, "
+              "no dead zone; rule not applicable")
+    else:
+        report["barrier_t"] = {"supervised": barrier_t_report(
+            cfg, bank["samples"], nm, args.t_margin, f"supervised: {len(ann)} annotated cases")}
+        if wbank is not None:
+            full = {p: {c: {"frac": bank["samples"][p][c]["frac"] + wbank["samples"][p][c]["frac"]}
+                        for c in bank["samples"][p]} for p in ("std", "exp")}
+            report["barrier_t"]["full"] = barrier_t_report(
+                cfg, full, nm, args.t_margin, f"full train pool: {len(ann) + len(withheld)} cases")
+        print("\n=== barrier_t summary ===")
+        for k, r in report["barrier_t"].items():
+            print(f"  {k:<11} all cases t > {r['t_all']:7.1f} ({r['t_all_from']}),  "
+                  f"95% t > {r['t_95']:7.1f} ({r['t_95_from']})  -> barrier_t ~ "
+                  f"{args.t_margin * r['t_all']:.0f} / {args.t_margin * r['t_95']:.0f}")
+
     if cfg.get("unannotated_mode", "drop") == "distribution":
         k = float(cfg.get("dist_k_mean", 2.0)); n_eff = float(cfg.get("dist_n_eff", 64.0))
         rel = float(cfg.get("dist_rel_std_tol", 0.25))
@@ -146,9 +260,9 @@ def main():
                   f"({100 * float(tg['tol_mu'][i, 0] / tg['mu'][i, 0]):.1f}%)  "
                   f"sd={float(tg['sd'][i, 0]):.5f} +-{float(tg['tol_sd'][i, 0]):.5f}")
 
-        if args.oracle and withheld:
+        if args.oracle and wbank is not None:
             print(f"\n=== ORACLE: does the TRUE withheld pool ({len(withheld)} cases) satisfy them? ===")
-            oracle = build_descriptor_bank(cfg, withheld, fc, classes, shapes, workdir=None, verbose=False)
+            oracle = wbank
             report["oracle_bank"] = oracle["bank"]
             report["oracle_check"] = {}
             for patch in ("std", "exp"):
