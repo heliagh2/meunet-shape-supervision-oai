@@ -23,13 +23,20 @@
 #   tolerances centroid/spread 0.012 are in normalised patch units, carried over
 #              from OAI. The AMOS patch is larger in mm, so the same number is a
 #              looser band anatomically (~3.5 mm in-plane, ~7 mm in z).
+#
+# --- t=300 update (from AMOS A1.13: test meanFGDice 0.507 -> 0.605) ---
+# barrier_t 70 -> 300 and centroid/avgdist_axis tolerance 0.012 -> 0.0058, the
+# same two changes as AMOS_A1_13_t300.yaml (see its header for the derivation
+# from tools/descriptor_stats.py). Everything else as originally ported.
+# The distribution matcher (withheld pool) uses the same barrier, so its
+# constraints also run at t=300.
 
 # (original OAI header: config/A2_1_distribution.yaml)
 
 # data (AMOS22 CT, preprocessed)
 images_dir: /projects/0/prjs1400/AMOS/amos22_meunet_ct/images
 labels_dir: /projects/0/prjs1400/AMOS/amos22_meunet_ct/labels
-splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset702_AMOS_CT/splits_final.json
+splits_file: /home/isimion1/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset702_AMOS_CT/splits_final.json
 dataset_name: Dataset702_AMOS_CT
 intensity_norm: none
 
@@ -142,7 +149,7 @@ lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
 centroid_norm: true             # normalize coords to [0,1]
 
 ##logbarrier toggles
-barrier_t: 70.0        # was 5.0
+barrier_t: 300.0       # 70 before the A1.13 update
 # Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
 # It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
 #   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
@@ -158,9 +165,9 @@ barrier_t_mu: 1.0
 barrier_t_max: 100.0
 
 volume_tolerance: 0.10
-centroid_tolerance: 0.012      # was 0.05; keeps stiffness ~200
+centroid_tolerance: 0.0058     # 0.012 before; same stiffness at t=300
 avgdist_tolerance: 0.05
-avgdist_axis_tolerance: 0.012  # was 0.05; achieved error ~0.002
+avgdist_axis_tolerance: 0.0058 # 0.012 before; same stiffness at t=300
 
 lambda_moment2: 0.0      # 6 covariance components
 lambda_moment3: 0.0       # 10 skewness components, target weight once fully warmed up
@@ -186,4 +193,4 @@ moment_inv_J3_tolerance: 1.0e-5
 use_wandb: true
 wandb_project: meunet-shape-supervision
 wandb_run_name: AMOS_A2.1_distribution_ann30
-workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/AMOS_A2_1_distribution
+workdir: /home/isimion1/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/AMOS_A2_1_distribution
