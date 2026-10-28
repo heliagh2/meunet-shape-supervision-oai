@@ -1579,6 +1579,16 @@ def main(cfg_path: str):
     moment_inv_classes = as_int_list(cfg.get("moment_inv_classes", desc_classes), default=desc_classes)
 
     shape_on = cfg.get("shape_on", "exp")  # "std" | "exp" | "both"
+    # Which head drives meanFGDice / dice_c* / best checkpoint / early stopping /
+    # viz. Both heads are always scored (val/std_*, val/exp_*). With shape_on=exp
+    # the STD branch never runs, and since enc1 is detached on EXP passes,
+    # enc1/up1/head1 stay at init -- selecting on STD would track noise.
+    select_on = cfg.get("select_on", "std")  # "std" | "exp"
+    if select_on not in ("std", "exp"):
+        raise ValueError(f"select_on must be 'std' or 'exp', got {select_on!r}")
+    if is_main and shape_on == "exp" and select_on == "std":
+        print("[WARN] shape_on=exp but select_on=std: head1 is never trained, "
+              "so model selection will follow an untrained head.")
 
     lambda_volume = float(cfg.get("lambda_volume", 1.0))
     lambda_centroid = float(cfg.get("lambda_centroid", 1.0))
@@ -1770,7 +1780,7 @@ def main(cfg_path: str):
                 )
                 viz_sample = viz_ds[0]
                 viz_slice_idx = select_viz_slice(
-                    viz_sample["std_lbl"].numpy(),
+                    viz_sample[f"{select_on}_lbl"].numpy(),
                     cartilage_classes=viz_cartilage_classes,
                     axis=viz_slice_axis,
                     min_pixels=viz_min_cartilage_pixels,
@@ -2642,8 +2652,10 @@ def main(cfg_path: str):
 
         # validation — all ranks participate, then metrics are all_reduced
         model.eval()
-        loss_va_seg = 0.0
-        dices_sum = None
+        # both heads scored every epoch; select_on picks which one becomes
+        # meanFGDice / dice_c* / loss_va_seg below
+        va_loss = {p: 0.0 for p in PATCH_KEYS}
+        va_dice = {p: np.zeros(cfg["n_classes"] - 1) for p in PATCH_KEYS}
         n_va = 0
         do_collapse = collapse_every > 0 and (epoch == 1 or epoch % collapse_every == 0)
         if do_collapse:
@@ -2653,17 +2665,19 @@ def main(cfg_path: str):
             col_sq = torch.zeros(2, n_cc, 7, dtype=torch.float64, device=device)
         with torch.no_grad():
             for batch in val_loader:
-                x = batch["std_img"].to(device, non_blocking=True)
-                y = batch["std_lbl"].to(device, non_blocking=True)
-                out = model(x, expanded=False)
-                logits = out["logit1"]
-                y_rs = resize_lbl_to_logits(y, logits)
-
-                if monitor_seg_loss:
-                    loss_va_seg += float(crit(logits, y_rs))
-
-                d = np.array(soft_dice_per_class(logits, y_rs, cfg["n_classes"]))
-                dices_sum = d if dices_sum is None else (dices_sum + d)
+                sel = None
+                for _p in PATCH_KEYS:
+                    _exp = (_p == "exp")
+                    x = batch[f"{_p}_img"].to(device, non_blocking=True)
+                    y = batch[f"{_p}_lbl"].to(device, non_blocking=True)
+                    _lg = model(x, expanded=_exp)["logit2" if _exp else "logit1"]
+                    _y = resize_lbl_to_logits(y, _lg)
+                    if monitor_seg_loss:
+                        va_loss[_p] += float(crit(_lg, _y))
+                    va_dice[_p] += np.array(soft_dice_per_class(_lg, _y, cfg["n_classes"]))
+                    if _p == select_on:
+                        sel = (_lg, _y)
+                logits, y_rs = sel
                 n_va += 1
 
                 if do_collapse:
@@ -2677,25 +2691,35 @@ def main(cfg_path: str):
                         col_sq[j] += (a * a * w).sum(dim=0)
                     col_n += present.double().sum(dim=0)
 
-        if dices_sum is None:
-            dices_sum = np.zeros(cfg["n_classes"] - 1)
-
         if use_ddp:
+            _nd = cfg["n_classes"] - 1
             va_t = torch.tensor(
-                [loss_va_seg, float(n_va)] + dices_sum.tolist(),
+                [float(n_va)] + [va_loss[p] for p in PATCH_KEYS]
+                + [v for p in PATCH_KEYS for v in va_dice[p].tolist()],
                 device=device, dtype=torch.float64,
             )
             dist.all_reduce(va_t, op=dist.ReduceOp.SUM)
             va_vals = va_t.cpu().tolist()
-            loss_va_seg = va_vals[0]
-            n_va_total = int(va_vals[1])
-            dices_sum = np.array(va_vals[2:])
+            n_va_total = int(va_vals[0])
+            for _j, _p in enumerate(PATCH_KEYS):
+                va_loss[_p] = va_vals[1 + _j]
+                _o = 1 + len(PATCH_KEYS) + _j * _nd
+                va_dice[_p] = np.array(va_vals[_o:_o + _nd])
         else:
             n_va_total = n_va
 
-        loss_va_seg = loss_va_seg / max(1, n_va_total) if monitor_seg_loss else 0.0
-        dices = dices_sum / max(1, n_va_total)
-        meanFGDice = float(dices.mean()) if dices is not None else 0.0
+        va_loss = {p: (va_loss[p] / max(1, n_va_total) if monitor_seg_loss else 0.0)
+                   for p in PATCH_KEYS}
+        va_dice = {p: va_dice[p] / max(1, n_va_total) for p in PATCH_KEYS}
+        loss_va_seg = va_loss[select_on]
+        dices = va_dice[select_on]
+        meanFGDice = float(dices.mean())
+        va_head_log = {}
+        for _p in PATCH_KEYS:
+            va_head_log[f"val/{_p}_seg"] = va_loss[_p]
+            va_head_log[f"val/{_p}_meanFGDice"] = float(va_dice[_p].mean())
+            for _k, _d in enumerate(va_dice[_p].tolist(), start=1):
+                va_head_log[f"val/{_p}_dice_c{_k}"] = float(_d)
 
         # --- constraint satisfaction (per group, per class, overall) ---------
         sat_log = {}
@@ -2909,6 +2933,8 @@ def main(cfg_path: str):
         }
         for k, d in enumerate(dices.tolist(), start=1):
             row[f"dice_c{k}"] = float(d)
+        row["select_on"] = select_on
+        row.update({k.replace("val/", "va_"): v for k, v in va_head_log.items()})
         row.update(collapse_log)
         row.update(dist_log)
         row.update(sat_log)
@@ -2945,14 +2971,17 @@ def main(cfg_path: str):
             raw_model = model.module if use_ddp else model
             raw_model.eval()
             with torch.no_grad():
-                x = viz_sample["std_img"].unsqueeze(0).to(device)
-                out = raw_model(x, expanded=False)
+                _vimg = viz_sample[f"{select_on}_img"]
+                _vlbl = viz_sample[f"{select_on}_lbl"]
+                x = _vimg.unsqueeze(0).to(device)
+                out = raw_model(x, expanded=(select_on == "exp"))
+                _vlogit = out["logit2" if select_on == "exp" else "logit1"]
                 # upsample the prediction back to the original patch resolution
                 # (rather than downsizing GT) so viz_slice_idx, picked once
-                # against std_lbl, stays valid across epochs.
+                # against the label, stays valid across epochs.
                 pred_full = F.interpolate(
-                    out["logit1"].argmax(dim=1, keepdim=True).float(),
-                    size=viz_sample["std_img"].shape[-3:],
+                    _vlogit.argmax(dim=1, keepdim=True).float(),
+                    size=_vimg.shape[-3:],
                     mode="nearest",
                 )[0, 0].long().cpu().numpy()
                 prob_full = None
@@ -2961,13 +2990,13 @@ def main(cfg_path: str):
                     # and smooth a speckled fog into something that looks like a
                     # coherent structure. The panel must show the model's actual
                     # probabilities, not an interpolation of them.
-                    _pr = F.softmax(out["logit1"].float(), dim=1)
-                    if tuple(_pr.shape[-3:]) != tuple(viz_sample["std_img"].shape[-3:]):
-                        _pr = F.interpolate(_pr, size=viz_sample["std_img"].shape[-3:],
+                    _pr = F.softmax(_vlogit.float(), dim=1)
+                    if tuple(_pr.shape[-3:]) != tuple(_vimg.shape[-3:]):
+                        _pr = F.interpolate(_pr, size=_vimg.shape[-3:],
                                             mode="nearest")
                     prob_full = _pr[0].cpu().numpy()
-            img_slice = np.take(viz_sample["std_img"][0].numpy(), viz_slice_idx, axis=viz_slice_axis)
-            gt_slice = np.take(viz_sample["std_lbl"].numpy(), viz_slice_idx, axis=viz_slice_axis)
+            img_slice = np.take(_vimg[0].numpy(), viz_slice_idx, axis=viz_slice_axis)
+            gt_slice = np.take(_vlbl.numpy(), viz_slice_idx, axis=viz_slice_axis)
             pred_slice = np.take(pred_full, viz_slice_idx, axis=viz_slice_axis)
             viz_log = {
                 "viz/segmentation": build_viz_wandb_image(img_slice, gt_slice, pred_slice, viz_class_names)
@@ -3078,6 +3107,7 @@ def main(cfg_path: str):
                 "val/meanFGDice":       meanFGDice,
                 **{f"val/dice_c{k}": float(d)
                    for k, d in enumerate(dices.tolist(), start=1)},
+                **va_head_log,
                 # schedule
                 "schedule/lr":              lr_now(opt),
                 "schedule/lambda_m3_eff":   lambda_moment3_eff,
@@ -3124,7 +3154,7 @@ def main(cfg_path: str):
                 torch.save(model_state, workdir / "checkpoint_budget_best.pt")
                 with open(workdir / "checkpoint_budget_best.json", "w") as f:
                     json.dump({"budget_epoch": budget_epoch, "epoch": epoch,
-                               "meanFGDice": float(metric)}, f, indent=2)
+                               "meanFGDice": float(metric), "select_on": select_on}, f, indent=2)
         if is_main and budget_epoch > 0 and epoch == budget_epoch:
             print(f"[budget] frozen at epoch {budget_epoch}: best was epoch "
                   f"{budget_best_epoch} with meanFGDice={budget_best_metric:.4f}")
@@ -3160,7 +3190,9 @@ def main(cfg_path: str):
                 f"m3={loss_tr_moment3:.4f}(err={loss_tr_moment3_err:.2e}) "
                 f"minv={loss_tr_moment_inv:.4f}(J1={loss_tr_moment_inv_J1_err:.2e},J2={loss_tr_moment_inv_J2_err:.2e},J3={loss_tr_moment_inv_J3_err:.2e}) | "
                 f"val seg={loss_va_seg:.4f} "
-                f"meanFGDice={meanFGDice:.4f} | "
+                f"meanFGDice={meanFGDice:.4f} [{select_on}] "
+                f"(std={va_head_log['val/std_meanFGDice']:.4f} "
+                f"exp={va_head_log['val/exp_meanFGDice']:.4f}) | "
                 f"best={best_metric:.4f} "
                 f"pat={patience}/{early_pat}"
             )

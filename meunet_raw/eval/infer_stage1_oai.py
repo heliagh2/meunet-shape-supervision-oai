@@ -123,20 +123,68 @@ def load_or_create_test_split(cfg, images_dir: Path):
     return test_ids
 
 
+HEADS = ("std", "exp")
+
+
+def exp_input_size(vol_shape, patch_size, expand_factor):
+    """
+    Size the full scan must be resampled to so the EXP head sees the same voxel
+    scale it was trained at. In training (_sample_fixed_patch_pair) each axis was
+    cropped to min(round(p * ef), dim) and resampled to p, i.e. scaled by
+    p / min(round(p * ef), dim). Apply that same per-axis factor to the full scan.
+    When the scan fits inside the expanded crop (OAI-ZIB: 384x384x160 vs 400^3)
+    this is exactly patch_size -- the EXP patch WAS the whole scan.
+    """
+    size = []
+    for d, p in zip(vol_shape, patch_size):
+        crop = min(max(int(round(p * expand_factor)), p), d)
+        size.append(int(round(d * p / crop)))
+    return tuple(size)
+
+
+def _forward_padded(model, x, expanded, key, mult=8):
+    """Replicate-pad to a multiple of `mult` (3 pooling levels), forward, crop back."""
+    shape = x.shape[-3:]
+    pad = [(-s) % mult for s in shape]
+    if any(pad):
+        x = F.pad(x, (0, pad[2], 0, pad[1], 0, pad[0]), mode="replicate")
+    out = model(x, expanded=expanded)[key]
+    # logit2 is half resolution: crop by the corresponding fraction
+    f = shape[0] / x.shape[-3], shape[1] / x.shape[-2], shape[2] / x.shape[-1]
+    return out[..., :round(out.shape[-3] * f[0]), :round(out.shape[-2] * f[1]),
+               :round(out.shape[-1] * f[2])]
+
+
 @torch.no_grad()
-def predict_case(img_path, out_path, stage1, device, n_classes):
+def predict_case(img_path, out_paths, stage1, device, patch_size, expand_factor):
+    """
+    Predict with BOTH heads and write one file per head (out_paths[head]).
+
+      std: full scan at native resolution -> logit1. Same voxel scale as the
+           raw STD crop, just a larger field of view.
+      exp: full scan resampled exactly as the EXP patch was in training ->
+           logit2 -> logits upsampled (trilinear) to native size -> argmax.
+    """
     img_nii = nib.load(str(img_path))
-    img = img_nii.get_fdata()  # (Z,Y,X)
+    img = img_nii.get_fdata()
     img = preprocess_volume(img)
+    native = img.shape
 
     # (1,1,D,H,W)
     img_t = torch.from_numpy(img[None, None, ...]).to(device)
 
-    out = stage1(img_t, expanded=False)["logit1"]   # (1,C,D,H,W)
-    pred = out.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int16)
+    logits = {"std": _forward_padded(stage1, img_t, False, "logit1")}
 
-    pred_nii = nib.Nifti1Image(pred, img_nii.affine, img_nii.header)
-    nib.save(pred_nii, str(out_path))
+    exp_size = exp_input_size(native, patch_size, expand_factor)
+    x_exp = F.interpolate(img_t, size=exp_size, mode="trilinear", align_corners=False)
+    lg2 = _forward_padded(stage1, x_exp, True, "logit2")
+    logits["exp"] = F.interpolate(lg2.float(), size=native, mode="trilinear", align_corners=False)
+
+    for head in HEADS:
+        assert tuple(logits[head].shape[-3:]) == tuple(native), (head, logits[head].shape, native)
+        pred = logits[head].argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int16)
+        pred_nii = nib.Nifti1Image(pred, img_nii.affine, img_nii.header)
+        nib.save(pred_nii, str(out_paths[head]))
 
 
 def main():
@@ -187,13 +235,22 @@ def main():
                 f"No test images left in {images_dir} after filtering by splits_test_final.json logic."
             )
 
+    patch_size = tuple(int(v) for v in cfg["patch_size"])
+    expand_factor = float(cfg.get("expand_factor", 1.25))  # same default as the dataset
+
+    # one subdir per head; eval_dice_oai.py picks both up from output_dir
+    for head in HEADS:
+        os.makedirs(out_dir / head, exist_ok=True)
+
     print(f"[INFO] Running stage-1 inference on {len(img_paths)} volumes from {images_dir}")
+    print(f"[INFO] Writing both heads: {out_dir}/std (logit1, native) and "
+          f"{out_dir}/exp (logit2, patch_size={patch_size}, expand_factor={expand_factor})")
     for i, img_path in enumerate(img_paths, 1):
         # strip _0000 so filenames match labelsTs directly
         out_name = img_path.name.replace("_0000", "")
-        out_path = out_dir / out_name
-        print(f"[{i:03d}/{len(img_paths):03d}] {img_path.name} -> {out_name}")
-        predict_case(img_path, out_path, stage1, device, n_classes)
+        out_paths = {head: out_dir / head / out_name for head in HEADS}
+        print(f"[{i:03d}/{len(img_paths):03d}] {img_path.name} -> {{std,exp}}/{out_name}")
+        predict_case(img_path, out_paths, stage1, device, patch_size, expand_factor)
 
     print("[INFO] Done stage-1 inference.")
 
