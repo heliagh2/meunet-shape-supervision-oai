@@ -1,0 +1,172 @@
+# === A2.1-EXP: A2.1 with the shape supervision on the EXP patch only ===
+# One change from A2.1: shape_on: exp (+ select_on: exp). Pairs with A1.13 the
+# way A2.1 pairs with A1.11: same 107 annotated, plus the 249 withheld under
+# the distribution constraint -- which now acts on the EXP pool only.
+# budget_epoch stays 75: both arms are EXP-only, so the steps/epoch ratio
+# vs A1.13 is the same as A2.1 vs A1.11.
+#
+# Same EXP-only consequences as A1.13 (see its header): every step is an EXP
+# step, enc1/up1/head1 never train, selection/val/viz follow the EXP head, and
+# the STD test-set Dice is meaningless -- read the [exp] block of eval_dice_oai.py.
+
+# === A2.1: THE METHOD -- distribution matching on the unannotated pool ===
+# (was A1_4_distribution; renamed because it is the proposal, not a sub-arm.)
+#
+# 356 cases: the 107 annotated keep their own GT descriptors at the A1.11
+# tolerances. The 249 withheld have their labels replaced by ignore and get NO
+# individual target. Their POOL is constrained instead:
+#     |mean_pool(d) - bank_mean| <= k*sigma/sqrt(n_eff)     (~ +-5% relative)
+#     |std_pool(d)  - bank_std | <= 0.25*bank_std
+# The std constraint is the point: collapsing every withheld case onto the mean
+# violates it, so individual knees stay free to differ while the group matches
+# the population. Batch size 2 cannot estimate a distribution, so each statistic
+# blends the current batch (carrying gradient) with a detached EMA of the pool.
+#
+# The bank is estimated from the 107 annotated cases only -- never from withheld
+# labels, which would leak exactly what the ablation pretends not to have.
+#
+# Read against A1.11 (same 107, withheld simply dropped): does unannotated data
+# help? And against A2.2: does it have to be distribution matching?
+
+# dataset: fixed per-case sampling (1 STD + 1 EXP patch reused for entire training)
+
+# data
+images_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_DESS
+labels_dir: /ivi/zfs/s0/original_homes/isimion/knee_dataset/OAI_ZIB_segmentations
+splits_file: /home/isimion/meunet-shape-supervision-oai/nnunet/nnUNet_preprocessed/Dataset701_OAIKnee/splits_final.json
+dataset_name: Dataset701_OAIKnee
+
+# --- distribution figure (diagnostic) ---
+# Logs distribution/{std,exp}_volume: annotated GT (the bank), withheld GT and
+# the predicted distribution on the pool, overlaid, one subplot per class.
+# ORACLE: log_oracle_distribution reads the GT of the WITHHELD cases. It is a
+# separate startup pass used ONLY for the plot -- it never touches the bank, the
+# tolerances or the loss. Do not wire it into anything.
+dist_plot_every_n_epochs: 25
+log_oracle_distribution: true
+
+# --- weak-annotation ablation ---
+annotated_fraction: 0.3
+annotation_seed: 0
+fixed_center: auto
+
+# --- concentration ("do not smear") ---
+lambda_concentration: 1.0
+concentration_classes: [2, 4]      # cartilage only; bones are already peaked
+concentration_tolerance: 0.25      # target concentration >= 0.75
+concentration_warmup_start: 20     # let volume/centroid place the mass first
+concentration_warmup_end: 60
+
+# --- unannotated pool ---
+unannotated_mode: distribution
+lambda_dist: 1.0
+dist_n_eff: 64
+dist_k_mean: 2.0
+dist_rel_std_tol: 0.25
+budget_epoch: 75
+collapse_log_every_n_vals: 5
+
+constraint_sat_every_n_steps: 1
+constraint_report_every: 10
+
+classes: [0, 1, 2, 3, 4]
+
+# model
+in_channels: 1
+n_classes: 5
+#EXP will become [400,400,400]
+patch_size: [200, 200, 200]
+expand_factor: 2.0
+enc_channels: [16, 32, 64, 128]
+dec_channels: [16, 32, 64]
+norm: batch
+
+# training / loader
+batch_size: 2
+num_workers: 6
+fg_sampling_prob: 0.5
+
+
+loss: dice_ce_weighted
+smooth_dice_eps: 1.0e-6
+
+optimizer: adam
+lr: 0.0009
+weight_decay: 1.0e-05
+amp: true
+
+epochs: 250
+early_stop_patience: 100
+min_lr: 1.0e-06
+deep_supervision_weight: 0.5
+
+seed: 777
+log_every: 25
+val_every: 1
+
+#visualizations
+viz_enable: true
+viz_every_n_epochs: 5
+
+#Exp toggles 
+use_seg_loss: false         # <— this makes it truly descriptor-only
+monitor_seg_loss: true      # <— keeps loss_va_seg + seg(log) comparable
+detach_desc_channels_for_seg: true  # irrelevant if use_seg_loss=false, but safe
+# all classes
+desc_only_classes: [1, 2, 3, 4]
+centroid_classes: [1, 2, 3, 4]
+volume_classes: [1, 2, 3, 4]
+avgdist_classes: [1, 2, 3, 4]
+avgdist_axis_classes: [1, 2, 3, 4]
+shape_on: exp                   # shape losses on EXP patch only
+select_on: exp                  # model selection / val / viz on the EXP head (logit2)
+
+lambda_volume: 1.0              # small now for first experiment logbarrier
+lambda_centroid: 5.0            # small now for first experiment logbarrier
+lambda_avgdist: 0.0             # radial mean distance to centroid barrier
+lambda_avgdist_axis: 1.0        # per-axis spread-to-centroid barrier
+centroid_norm: true             # normalize coords to [0,1]
+
+##logbarrier toggles
+barrier_t: 70.0        # was 5.0
+# Schedule OFF (mu = 1.0, the code default): t stays at 5.0 for the whole run.
+# It was on (1.01) for the first A1.0/A1.1 pair. Two reasons to drop it:
+#   - t advances per EPOCH, but arms differ in steps/epoch (107 vs 356 cases),
+#     so a scheduled t makes constraint tightness depend on dataset size.
+#   - the barrier switches to its linear extension when |z| < 1/t^2, and that
+#     threshold moves with t (0.040 at t=5, 0.0056 at t=13.4), so a growing t
+#     changes the loss's CHARACTER mid-run, per class, not just its scale.
+# At the fixed t=5, 1/t^2 = 0.040: every volume constraint (effective tolerance
+# 0.10*gt_frac = 0.0007-0.023) sits in the hinge regime for ALL classes, which
+# at least makes them behave uniformly; centroid and avgdist_axis at tol 0.05
+# sit just inside the log region.
+barrier_t_mu: 1.0
+barrier_t_max: 100.0
+
+volume_tolerance: 0.10
+centroid_tolerance: 0.012      # was 0.05; keeps stiffness ~200
+avgdist_tolerance: 0.05
+avgdist_axis_tolerance: 0.012  # was 0.05; achieved error ~0.002
+
+lambda_moment2: 0.0      # 6 covariance components
+lambda_moment3: 0.0       # 10 skewness components, target weight once fully warmed up
+moment3_warmup_start: 100     # starts warming up at epoch 100
+moment3_warmup_end: 200       # fully at 0.05 by epoch 200
+#lambda_moment_inv: 0.0       # 3 rotation-invariant scalars (J1/J2/J3)
+
+moment2_sqrt_diagonal: true   # sqrt of diagonal → sigma_z/y/x, stronger grad for thin structures
+moment2_tolerance: 0.05
+moment3_tolerance: 0.01  # updated according to values
+moment_inv_tolerance: 0.01
+
+lambda_moment_inv_J1: 0.0       # disable J1
+lambda_moment_inv_J2: 0.0
+lambda_moment_inv_J3: 0.0
+moment_inv_J1_tolerance: 0.01
+moment_inv_J2_tolerance: 5.0e-4
+moment_inv_J3_tolerance: 1.0e-5
+
+use_wandb: true
+wandb_project: meunet-shape-supervision
+wandb_run_name: A2.1_exp_only_ann30
+workdir: /home/isimion/meunet-shape-supervision-oai/oai_baselines/meunet_raw/results/A2_1_exp_only_ann30
