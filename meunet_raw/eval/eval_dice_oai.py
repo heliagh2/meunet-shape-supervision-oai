@@ -79,6 +79,9 @@ def main():
                          "or a legacy flat directory of STD predictions")
     ap.add_argument("--out_csv", default=None, help="Optional CSV file to save per-case Dice")
     ap.add_argument("--labels", nargs="+", type=int, default=[1, 2, 3, 4], help="Foreground label IDs")
+    ap.add_argument("--cases_from_pred", action="store_true",
+                    help="evaluate only GT cases that have predictions (e.g. a val-split run "
+                         "against the full labels dir) instead of warning on every other case")
     args = ap.parse_args()
 
     gt_files = sorted(glob.glob(os.path.join(args.gt_dir, "*.nii*")))
@@ -86,13 +89,24 @@ def main():
         raise RuntimeError(f"No GT files found in {args.gt_dir}")
     print(f"[INFO] Found {len(gt_files)} GT files")
 
-    # Both heads whenever infer_stage1_oai.py wrote them. A flat dir predates
-    # that and only ever held STD (logit1) predictions.
-    head_dirs = {h: os.path.join(args.pred_dir, h) for h in HEADS}
-    if not all(os.path.isdir(d) for d in head_dirs.values()):
+    # Every subdir holding predictions is one head / fusion variant (std and exp
+    # from infer_stage1_oai.py, plus avg/conf/... from infer_fusion_oai.py). A
+    # flat dir predates that and only ever held STD (logit1) predictions.
+    subdirs = sorted(d for d in os.listdir(args.pred_dir)
+                     if glob.glob(os.path.join(args.pred_dir, d, "*.nii*")))
+    subdirs = [h for h in HEADS if h in subdirs] + [d for d in subdirs if d not in HEADS]
+    head_dirs = {h: os.path.join(args.pred_dir, h) for h in subdirs}
+    if not all(h in head_dirs for h in HEADS):
         print(f"[WARN] {args.pred_dir} has no std/ and exp/ subdirs: treating it as legacy "
               f"STD-only predictions. Re-run infer_stage1_oai.py to get the EXP head too.")
         head_dirs = {"std": args.pred_dir}
+
+    if args.cases_from_pred:
+        # e.g. a val-split run: score only the cases that were predicted
+        have = {normalize_case_name(p)
+                for d in head_dirs.values() for p in glob.glob(os.path.join(d, "*.nii*"))}
+        gt_files = [g for g in gt_files if normalize_case_name(g) in have]
+        print(f"[INFO] --cases_from_pred: restricted to {len(gt_files)} predicted cases")
 
     results = {}
     for head, d in head_dirs.items():

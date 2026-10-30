@@ -156,24 +156,20 @@ def _forward_padded(model, x, expanded, key, mult=8):
 
 
 @torch.no_grad()
-def predict_case(img_path, out_paths, stage1, device, patch_size, expand_factor):
+def head_logits(stage1, img, device, patch_size, expand_factor):
     """
-    Predict with BOTH heads and write one file per head (out_paths[head]).
+    Native-resolution logits (1,C,D,H,W) of BOTH heads for one preprocessed scan.
 
       std: full scan at native resolution -> logit1. Same voxel scale as the
            raw STD crop, just a larger field of view.
       exp: full scan resampled exactly as the EXP patch was in training ->
-           logit2 -> logits upsampled (trilinear) to native size -> argmax.
+           logit2 -> logits upsampled (trilinear) to native size.
     """
-    img_nii = nib.load(str(img_path))
-    img = img_nii.get_fdata()
-    img = preprocess_volume(img)
     native = img.shape
-
     # (1,1,D,H,W)
     img_t = torch.from_numpy(img[None, None, ...]).to(device)
 
-    logits = {"std": _forward_padded(stage1, img_t, False, "logit1")}
+    logits = {"std": _forward_padded(stage1, img_t, False, "logit1").float()}
 
     exp_size = exp_input_size(native, patch_size, expand_factor)
     x_exp = F.interpolate(img_t, size=exp_size, mode="trilinear", align_corners=False)
@@ -182,6 +178,17 @@ def predict_case(img_path, out_paths, stage1, device, patch_size, expand_factor)
 
     for head in HEADS:
         assert tuple(logits[head].shape[-3:]) == tuple(native), (head, logits[head].shape, native)
+    return logits
+
+
+@torch.no_grad()
+def predict_case(img_path, out_paths, stage1, device, patch_size, expand_factor):
+    """Predict with BOTH heads and write one file per head (out_paths[head])."""
+    img_nii = nib.load(str(img_path))
+    img = preprocess_volume(img_nii.get_fdata())
+    logits = head_logits(stage1, img, device, patch_size, expand_factor)
+
+    for head in HEADS:
         pred = logits[head].argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int16)
         pred_nii = nib.Nifti1Image(pred, img_nii.affine, img_nii.header)
         nib.save(pred_nii, str(out_paths[head]))
